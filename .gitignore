@@ -1,0 +1,30 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C / C++ build artifacts
+*.obj
+*.o
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Test binary containers
+tests/*.rada
+*.rada
+
+# Scratch / temporary development scripts
+scratch/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

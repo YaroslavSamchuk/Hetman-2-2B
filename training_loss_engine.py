@@ -37,14 +37,17 @@ class TernaryQuantizeSTE(torch.autograd.Function):
         scaled_w = w / gamma
         w_quant = torch.clamp(torch.round(scaled_w), -1.0, 1.0)
         ctx.save_for_backward(scaled_w)
+        ctx.gamma = gamma
         return w_quant, gamma
 
     @staticmethod
     def backward(ctx, grad_w_quant: torch.Tensor, grad_gamma: Optional[torch.Tensor]) -> Tuple[torch.Tensor, None]:
         scaled_w, = ctx.saved_tensors
+        gamma = ctx.gamma
         # Straight-Through Estimator with gradient clipping outside [-1, 1]
+        # and scale compensation dividing by gamma to eliminate gradient vanishing
         mask = (torch.abs(scaled_w) <= 1.0).to(grad_w_quant.dtype)
-        grad_w = grad_w_quant * mask
+        grad_w = (grad_w_quant / gamma) * mask
         return grad_w, None
 
 
@@ -186,14 +189,14 @@ class HierarchicalRVQLoss(nn.Module):
         # Level 0 quantization
         q0, indices_l0 = self.quantize_level(z0, self.codebook_l0)
 
-        # Level 1 residual quantization
-        residual = z0 - q0
+        # Level 1 residual quantization (detach q0 to prevent backwards gradient into codebook L0)
+        residual = z0 - q0.detach()
         q1, indices_l1 = self.quantize_level(residual, self.codebook_l1)
 
         # Composite quantized vector
         z_q = q0 + q1
 
-        # Commitment loss: encoder learns to commit to centroids
+        # Commitment loss: encoder learns to commit to centroids (codebooks detached)
         commit_loss = F.mse_loss(z0, q0.detach()) + F.mse_loss(residual, q1.detach())
 
         # Codebook update loss (if codebook is trainable)
@@ -248,8 +251,10 @@ class HopfieldAttractorLoss(nn.Module):
         # beta <z, M_k>
         logits = self.beta * F.linear(z, self.patterns)  # [Batch, NumPatterns]
         logsumexp_val = torch.logsumexp(logits, dim=-1)
-        quad_term = 0.5 * torch.sum(z.pow(2), dim=-1)
-        return - (1.0 / self.beta) * logsumexp_val + quad_term
+        # Normalized by dimension to maintain gradient and loss parity with cross-entropy
+        quad_term = 0.5 * torch.mean(z.pow(2), dim=-1)
+        logsumexp_term = (1.0 / (self.beta * self.dim)) * logsumexp_val
+        return - logsumexp_term + quad_term
 
     def forward(self, z_target: torch.Tensor, z_neg: Optional[torch.Tensor] = None) -> torch.Tensor:
         # Minimize energy for target representation
@@ -503,7 +508,7 @@ class HetmanCompositeLossEngine(nn.Module):
         if target_flat.numel() > 0:
             loss_bidirectional = F.cross_entropy(refine_flat, target_flat)
         else:
-            loss_bidirectional = torch.tensor(0.0, device=logits_k0.device, requires_grad=True)
+            loss_bidirectional = capped_refine.sum() * 0.0
 
         # 4. Get dynamic lambdas
         lambdas = self.get_lambdas(step, max_steps)

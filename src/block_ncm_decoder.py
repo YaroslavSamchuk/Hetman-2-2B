@@ -14,7 +14,7 @@ Features:
 
 import math
 from dataclasses import dataclass, field
-from typing import Tuple, Optional, Dict, List, Any
+from typing import Tuple, Optional, Dict, List, Any, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -289,8 +289,15 @@ class ConfidenceGate(nn.Module):
         confidence, argmax_tokens = torch.max(probs, dim=-1)
 
         # Exact Categorical Shannon Entropy: H = - sum(p * log p)
-        entropy = -torch.sum(probs * log_probs, dim=-1)  # [B, L_win]
-        normalized_entropy = entropy / self.max_entropy   # [B, L_win] in [0, 1]
+        # Numerically stable: 0 * (-inf) guarded to avoid NaN on extreme/masked logits
+        plogp = torch.where(
+            (probs > 0.0) & torch.isfinite(log_probs),
+            probs * log_probs,
+            torch.zeros_like(probs)
+        )
+        entropy = -torch.sum(plogp, dim=-1)  # [B, L_win]
+        entropy = torch.clamp(entropy, min=0.0)
+        normalized_entropy = entropy / max(self.max_entropy, 1e-9)   # [B, L_win] in [0, 1]
 
         # Identify uncertain positions
         uncertain = (confidence < self.confidence_threshold) | (normalized_entropy > self.entropy_threshold)
@@ -556,18 +563,23 @@ class BlockNCMDecoder(nn.Module):
         logits: torch.Tensor,
         current_tokens: torch.Tensor,
         uncertain_mask: Optional[torch.Tensor] = None,
-        window: int = 4
+        window: int = 4,
+        decay_gamma: float = 0.8,
+        whitelist: Optional[set] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Sequentially selects argmax tokens while dynamically penalizing recent tokens
-        within the immediate history window to mathematically eliminate the Non-Autoregressive
-        Multi-Token Repetition Curse.
+        Sequentially selects argmax tokens while dynamically applying a Distance-Decay
+        Soft Penalty to recent tokens within the history window:
+            penalty(d) = base_penalty * exp(-decay_gamma * (d - 1))
+        This eliminates the Non-Autoregressive Multi-Token Repetition Curse (stutters at d=1)
+        while preserving legitimate syntactic repetitions (enumerations with commas,
+        paired conjunctions 'і...і', prepositions 'в...в') in Ukrainian.
         """
         logits_penalized = logits.clone()
         logits_penalized[:, :, self.mask_token_id] = -1e9
         l_tot = self.cfg.total_window_len
         n_over = self.cfg.overlap_len
-        penalty_val = self.cfg.repetition_penalty * 20.0
+        base_penalty_val = self.cfg.repetition_penalty * 20.0
 
         for pos in range(n_over, l_tot):
             if uncertain_mask is None or uncertain_mask[0, pos]:
@@ -575,7 +587,11 @@ class BlockNCMDecoder(nn.Module):
                 for prev_idx in range(hist_start, pos):
                     prev_tok = current_tokens[0, prev_idx].item()
                     if 0 <= prev_tok < self.cfg.vocab_size:
-                        logits_penalized[0, pos, prev_tok] -= penalty_val
+                        if whitelist is not None and prev_tok in whitelist:
+                            continue
+                        d = pos - prev_idx
+                        decay_factor = math.exp(-decay_gamma * (d - 1))
+                        logits_penalized[0, pos, prev_tok] -= base_penalty_val * decay_factor
                 current_tokens[0, pos] = torch.argmax(logits_penalized[0, pos])
         return current_tokens, logits_penalized
 
@@ -785,24 +801,27 @@ class BlockNCMDecoder(nn.Module):
 # ==============================================================================
 
 def seamless_bpe_stitch(
-    tokens_prev: List[int],
-    tokens_curr: List[int],
+    tokens_prev: Union[List[int], torch.Tensor],
+    tokens_curr: Union[List[int], torch.Tensor],
     tokenizer: Optional[Any] = None
 ) -> str:
     """
     Stitches adjacent 400-token blocks without whitespace distortion or subword splitting.
-    If no tokenizer is passed, returns a formatted token ID stream report.
+    Concatenates the token stream in token ID space before invoking byte-level BPE decoding,
+    preventing multi-byte UTF-8 Cyrillic boundary tearing and duplicate whitespace injection.
     """
+    if isinstance(tokens_prev, torch.Tensor):
+        tokens_prev = tokens_prev.detach().cpu().tolist()
+    if isinstance(tokens_curr, torch.Tensor):
+        tokens_curr = tokens_curr.detach().cpu().tolist()
+
+    combined_tokens = list(tokens_prev) + list(tokens_curr)
     if tokenizer is not None:
-        last_str = tokenizer.decode([tokens_prev[-1]])
-        first_str = tokenizer.decode([tokens_curr[0]])
-        is_continuation = not first_str.startswith(" ") and not first_str.startswith("Ġ")
-        if is_continuation:
-            return tokenizer.decode(tokens_prev) + tokenizer.decode(tokens_curr)
-        else:
-            return tokenizer.decode(tokens_prev) + " " + tokenizer.decode(tokens_curr)
-    else:
-        return f"Stream[{len(tokens_prev)} + {len(tokens_curr)} = {len(tokens_prev) + len(tokens_curr)} tokens]"
+        if hasattr(tokenizer, "decode"):
+            return tokenizer.decode(combined_tokens)
+        elif callable(tokenizer):
+            return tokenizer(combined_tokens)
+    return f"Stream[{len(tokens_prev)} + {len(tokens_curr)} = {len(combined_tokens)} tokens]"
 
 
 # ==============================================================================

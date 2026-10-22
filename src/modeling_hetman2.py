@@ -244,6 +244,12 @@ class GlobalAttention(nn.Module):
         bidirectional: bool = False
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         B, L, _ = x.shape
+        if L == 0:
+            return torch.zeros(B, 0, self.hidden_size, device=x.device, dtype=x.dtype), past_kv
+
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            x = torch.nan_to_num(x, nan=0.0, posinf=50.0, neginf=-50.0)
+
         q = self.q_proj(x).view(B, L, self.num_heads, self.head_dim)
         k = self.k_proj(x).view(B, L, self.num_kv_heads, self.head_dim)
         v = self.v_proj(x).view(B, L, self.num_kv_heads, self.head_dim)
@@ -367,6 +373,18 @@ class GatedDeltaNet(nn.Module):
             else:
                 S = prev_state
 
+        # Graceful handling of zero-length sequence
+        if L == 0:
+            if S is None:
+                S = torch.zeros(B, self.num_heads, self.head_dim, self.head_dim, device=x.device, dtype=torch.float32)
+            if conv_state is None:
+                conv_state = torch.zeros(B, D, max(1, self.conv_kernel - 1), device=x.device, dtype=x.dtype)
+            return torch.zeros(B, 0, self.hidden_size, device=x.device, dtype=x.dtype), (conv_state, S)
+
+        # Numerical self-healing quench against poisoned activations
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            x = torch.nan_to_num(x, nan=0.0, posinf=50.0, neginf=-50.0)
+
         # 1. Causal 1D Convolution over input tokens
         k_sz = self.conv_kernel
         if L == 1 and conv_state is not None:
@@ -398,11 +416,13 @@ class GatedDeltaNet(nn.Module):
         alpha_fp32 = torch.sigmoid(self.alpha_proj(x_eff)).float()
         beta_fp32 = torch.sigmoid(self.beta_proj(x_eff)).float()
 
-        # Initialize recurrent state strictly in FP32
+        # Initialize or quench recurrent state strictly in FP32
         if S is None:
             S = torch.zeros(B, self.num_heads, self.head_dim, self.head_dim, device=x.device, dtype=torch.float32)
         else:
             S = S.float()
+            if torch.isnan(S).any() or torch.isinf(S).any():
+                S = torch.nan_to_num(S, nan=0.0, posinf=50.0, neginf=-50.0)
 
         outputs = []
         # 4. Stepwise Linear Recurrence (Gated Delta Rule)
@@ -501,6 +521,11 @@ class SpeculativeLatentHopfieldCore(nn.Module):
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         B, L, _ = x.shape
+        if L == 0:
+            return torch.zeros(B, 0, x.shape[-1], device=x.device, dtype=x.dtype), torch.tensor(0.0, device=x.device)
+
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
 
         # 1. Project and normalize subqueries
         z = self.q_norm(self.q_proj(x))
@@ -687,25 +712,49 @@ class SemanticDeduplicationFilter(nn.Module):
         c_hat = c / c_norm
         M = torch.bmm(c_hat, c_hat.transpose(1, 2))  # [B, K, K]
 
-        H_out = H.clone()
+        # Accumulate additive delta for each chunk to avoid in-place slice mutation on H and c
+        delta_H_list = []
         repulsion_events = 0
 
         for b in range(B):
+            c_b = [c[b, k] for k in range(K)]
+            deltas_b = [torch.zeros(L_c, d, device=H.device, dtype=H.dtype) for _ in range(K)]
+
             for i in range(K):
                 for j in range(i + 1, K):
-                    sim = M[b, i, j].item()
+                    c_i = c_b[i]
+                    c_j = c_b[j]
+
+                    c_i_norm = torch.norm(c_i, p=2).clamp(min=self.eps)
+                    c_j_norm = torch.norm(c_j, p=2).clamp(min=self.eps)
+                    sim = float(torch.clamp(
+                        torch.dot(c_i, c_j) / (c_i_norm * c_j_norm), -1.0, 1.0
+                    ).item())
+
                     if sim > self.tau:
                         repulsion_events += 1
-                        c_i = c[b, i]
-                        c_j = c[b, j]
-                        c_i_norm_sq = torch.dot(c_i, c_i) + self.eps
+                        c_i_norm_sq = torch.dot(c_i, c_i).clamp(min=self.eps)
                         proj_coeff = torch.dot(c_j, c_i) / c_i_norm_sq
                         proj_vec = proj_coeff * c_i
                         alpha_rep = min(1.0, (sim - self.tau) / (1.0 - self.tau + self.eps))
                         delta_c = - alpha_rep * proj_vec
-                        H_out[b, j] = H_out[b, j] + delta_c.unsqueeze(0)
-                        c[b, j] = H_out[b, j].mean(dim=0)
 
+                        c_j_candidate = c_j + delta_c
+                        if float(torch.norm(c_j_candidate, p=2).item()) < 1e-4:
+                            noise = torch.randn_like(c_j)
+                            noise_proj = (torch.dot(noise, c_i) / c_i_norm_sq) * c_i
+                            noise_ortho = noise - noise_proj
+                            noise_norm = torch.norm(noise_ortho, p=2).clamp(min=self.eps)
+                            delta_c = delta_c + (noise_ortho / noise_norm) * c_j_norm
+
+                        # Update running centroid out-of-place (new tensor assignment in list)
+                        c_b[j] = c_b[j] + delta_c
+                        deltas_b[j] = deltas_b[j] + delta_c.unsqueeze(0)
+
+            delta_H_list.append(torch.stack(deltas_b, dim=0))
+
+        delta_H = torch.stack(delta_H_list, dim=0)
+        H_out = H + delta_H
         return H_out, M, repulsion_events
 
 
@@ -729,7 +778,12 @@ class BoundarySeamSmoother(nn.Module):
 
     def forward(self, H: torch.Tensor) -> torch.Tensor:
         B, K, L_c, d = H.shape
-        H_out = H.clone()
+        if K <= 1:
+            return H
+
+        # Accumulate updates out-of-place to protect autograd computation graph
+        delta_H = torch.zeros_like(H)
+
         for k in range(K - 1):
             h_exit = H[:, k, -1, :]
             h_entry = H[:, k + 1, 0, :]
@@ -742,9 +796,13 @@ class BoundarySeamSmoother(nn.Module):
 
             for m in range(min(self.window_size, L_c)):
                 decay = math.exp(-m / self.lambda_decay)
-                H_out[:, k + 1, m, :] = H_out[:, k + 1, m, :] + decay * gate * diff_fwd
+                update_fwd = decay * gate * diff_fwd
+                delta_H[:, k + 1, m, :] = delta_H[:, k + 1, m, :] + update_fwd
                 if L_c - 1 - m >= 0:
-                    H_out[:, k, L_c - 1 - m, :] = H_out[:, k, L_c - 1 - m, :] + decay * (1.0 - gate) * diff_bwd
+                    update_bwd = decay * (1.0 - gate) * diff_bwd
+                    delta_H[:, k, L_c - 1 - m, :] = delta_H[:, k, L_c - 1 - m, :] + update_bwd
+
+        H_out = H + delta_H
         return H_out
 
 
@@ -1115,9 +1173,15 @@ class Hetman2Model(Hetman2PreTrainedModel):
         """
         if inputs_embeds is None:
             assert input_ids is not None, "Either input_ids or inputs_embeds must be provided"
+            # Adversarial quarantine shield: clamp input token IDs to valid vocabulary range
+            input_ids = torch.clamp(input_ids, 0, self.config.vocab_size - 1)
             x = self.embed_tokens(input_ids)
         else:
             x = inputs_embeds
+
+        # Numerical quench against poisoned input embeddings
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            x = torch.nan_to_num(x, nan=0.0, posinf=10.0, neginf=-10.0)
 
         # Inject Mode Conditioning Vector (100% parameter reuse without memory bloating)
         x = x + self.mode_embeddings[mode]
@@ -1259,6 +1323,9 @@ class Hetman2ForCausalLM(Hetman2PreTrainedModel):
         offset: int = 0,
         attention_mask: Optional[torch.Tensor] = None
     ) -> Dict[str, Any]:
+        if input_ids is not None:
+            input_ids = torch.clamp(input_ids, 0, self.config.vocab_size - 1)
+
         hidden_states, hopfield_loss, new_states = self.model(
             input_ids=input_ids,
             inputs_embeds=inputs_embeds,
@@ -1281,7 +1348,7 @@ class Hetman2ForCausalLM(Hetman2PreTrainedModel):
             if valid_mask.any():
                 ce_loss = F.cross_entropy(shift_logits.view(-1, self.config.vocab_size), shift_labels.view(-1))
             else:
-                ce_loss = torch.tensor(0.0, device=logits.device, requires_grad=True)
+                ce_loss = shift_logits.sum() * 0.0
 
             # 2. Multi-Token Prediction (t + 2)
             if input_ids.shape[1] > 2:
@@ -1293,9 +1360,9 @@ class Hetman2ForCausalLM(Hetman2PreTrainedModel):
                 if valid_mask_mtp.any():
                     mtp_loss = F.cross_entropy(shift_logits_mtp.view(-1, self.config.vocab_size), shift_labels_mtp.view(-1))
                 else:
-                    mtp_loss = torch.tensor(0.0, device=logits.device)
+                    mtp_loss = shift_logits_mtp.sum() * 0.0
             else:
-                mtp_loss = torch.tensor(0.0, device=logits.device)
+                mtp_loss = logits.sum() * 0.0
 
             loss = ce_loss + 0.3 * mtp_loss + 0.005 * hopfield_loss
 

@@ -215,6 +215,15 @@ class DeltaNetStateBundle:
 BlockCausalStateBundle = DeltaNetStateBundle
 
 
+def safe_l2_normalize(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    """
+    Безпечна L2-нормалізація зі згладжуванням градієнта при ||x|| -> 0.
+    Усуває градієнтний спайк 100,000x у F.normalize(eps=1e-5) без порушення унітарної норми.
+    """
+    norm = torch.sqrt(torch.sum(x * x, dim=dim, keepdim=True) + eps)
+    return x / norm
+
+
 # ============================================================================
 # 3. МЕНЕДЖЕР ЗНІМКІВ СТАНУ ТА ВІДКАТУ ЧАТУ (STATE SNAPSHOT & RESTORE)
 # ============================================================================
@@ -231,21 +240,67 @@ class StateSnapshotManager:
        дослідження різних варіантів відповідей з одного кореневого стану.
     3. Контрольні точки NCM (NCM Block Checkpoints) для надійного відновлення після збоїв.
     """
-    def __init__(self):
+    def __init__(
+        self,
+        max_hot_snapshots: Optional[int] = None,
+        offload_to_cpu: bool = False,
+        auto_memory_reclaim: bool = True
+    ):
         self._snapshots: Dict[str, DeltaNetStateBundle] = {}
         self._chat_history: List[Dict[str, Any]] = []
+        self.max_hot_snapshots = max_hot_snapshots
+        self.offload_to_cpu = offload_to_cpu
+        self.auto_memory_reclaim = auto_memory_reclaim
+
+    def _sanitize_metadata(self, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """Санітизує метадані, видаляючи живі графи autograd та переміщуючи тензори на CPU."""
+        if not metadata:
+            return {}
+        clean = {}
+        for k, v in metadata.items():
+            if isinstance(v, torch.Tensor):
+                clean[k] = v.detach().cpu()
+            else:
+                try:
+                    clean[k] = copy.deepcopy(v)
+                except Exception:
+                    clean[k] = str(v)
+        return clean
+
+    @staticmethod
+    def _extract_turn_id(name: str) -> Optional[int]:
+        """Надійний витяг чисельного turn_id без падіння на складних назвах."""
+        if not name.startswith("turn_"):
+            return None
+        parts = name.split("_")
+        for part in reversed(parts):
+            if part.isdigit():
+                return int(part)
+        return None
 
     def save_snapshot(
         self,
         name: str,
         bundle: DeltaNetStateBundle,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        offload_to_cpu: Optional[bool] = None
     ) -> None:
-        """Зберігає імутабельний знімок стану за унікальним іменем."""
+        """Зберігає імутабельний знімок стану за унікальним іменем з ізоляцією пам'яті."""
         cloned = bundle.detach_clone()
+        should_offload = self.offload_to_cpu if offload_to_cpu is None else offload_to_cpu
+        if should_offload:
+            cloned = cloned.to(torch.device("cpu"))
+
         if metadata:
-            cloned.metadata.update(metadata)
+            clean_meta = self._sanitize_metadata(metadata)
+            cloned.metadata.update(clean_meta)
+
         self._snapshots[name] = cloned
+
+        # Обмеження місткості LRU (якщо встановлено)
+        if self.max_hot_snapshots is not None and len(self._snapshots) > self.max_hot_snapshots:
+            oldest_key = next(iter(self._snapshots))
+            del self._snapshots[oldest_key]
 
     def restore_snapshot(self, name: str) -> DeltaNetStateBundle:
         """
@@ -268,6 +323,8 @@ class StateSnapshotManager:
         """Видаляє знімок для негайного звільнення пам'яті."""
         if name in self._snapshots:
             del self._snapshots[name]
+            if self.auto_memory_reclaim:
+                self.reclaim_memory()
             return True
         return False
 
@@ -275,10 +332,19 @@ class StateSnapshotManager:
         """Повертає список імен усіх активних знімків."""
         return list(self._snapshots.keys())
 
+    def reclaim_memory(self) -> None:
+        """Примусова санітизація та дефрагментація кешу пам'яті PyTorch / CUDA."""
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def clear(self) -> None:
         """Очищує всі збережені знімки."""
         self._snapshots.clear()
         self._chat_history.clear()
+        if self.auto_memory_reclaim:
+            self.reclaim_memory()
 
     # ------------------------------------------------------------------------
     # Спеціалізований інтерфейс для діалогового чату (Chat History Rollback)
@@ -289,7 +355,8 @@ class StateSnapshotManager:
         bundle: DeltaNetStateBundle,
         user_prompt: Optional[str] = None,
         assistant_response: Optional[str] = None,
-        extra_info: Optional[Dict[str, Any]] = None
+        extra_info: Optional[Dict[str, Any]] = None,
+        offload_to_cpu: Optional[bool] = None
     ) -> None:
         """
         Фіксує стан після завершення чергового раунду (turn) діалогу.
@@ -306,7 +373,7 @@ class StateSnapshotManager:
         if extra_info:
             meta.update(extra_info)
 
-        self.save_snapshot(snapshot_name, bundle, metadata=meta)
+        self.save_snapshot(snapshot_name, bundle, metadata=meta, offload_to_cpu=offload_to_cpu)
         self._chat_history.append(meta)
 
     def rollback_to_chat_turn(self, turn_id: int) -> DeltaNetStateBundle:
@@ -318,17 +385,22 @@ class StateSnapshotManager:
         snapshot_name = f"turn_{turn_id}"
         restored = self.restore_snapshot(snapshot_name)
 
-        # Видаляємо всі пізніші знімки та записи історії (Pruning subsequent branches)
-        to_delete = [
-            name for name in self._snapshots.keys()
-            if name.startswith("turn_") and int(name.split("_")[1]) > turn_id
-        ]
+        # Видаляємо всі пізніші знімки та записи історії (надійний розбір turn_id)
+        to_delete = []
+        for name in list(self._snapshots.keys()):
+            parsed_id = self._extract_turn_id(name)
+            if parsed_id is not None and parsed_id > turn_id:
+                to_delete.append(name)
+
         for name in to_delete:
             del self._snapshots[name]
 
         self._chat_history = [
             rec for rec in self._chat_history if rec.get("turn_id", 0) <= turn_id
         ]
+
+        if self.auto_memory_reclaim:
+            self.reclaim_memory()
 
         return restored
 
@@ -589,10 +661,18 @@ class GatedDeltaNetLayer(nn.Module):
         # --------------------------------------------------------------------
         # 1. Локальна каузальна 1D згортка з неперервним буфером (k=4)
         # --------------------------------------------------------------------
+        # Захист від міждокументного витоку контексту (Cross-Document Contamination)
+        if state_reset_mask is not None:
+            reset_init = state_reset_mask[:, 0:1, None].to(dtype=conv_state.dtype, device=conv_state.device)
+            conv_state = conv_state * reset_init
+
         x_trans = x.transpose(1, 2)  # [B, D, L]
         # Безшовне доповнення історії: [B, D, (k-1) + L]
         x_padded = torch.cat([conv_state, x_trans], dim=-1)
-        next_conv_state = x_padded[:, :, -(k_sz - 1):].detach()
+        # Усунення PyTorch Storage Leak (клонування відсікає базовий буфер x_padded)
+        next_conv_state = x_padded[:, :, -(k_sz - 1):].clone()
+        if not self.training:
+            next_conv_state = next_conv_state.detach()
 
         x_conv = F.silu(self.conv1d(x_padded)).transpose(1, 2)  # [B, L, D]
         x_eff = x + x_conv  # Residual зв'язок локальної згортки
@@ -605,12 +685,14 @@ class GatedDeltaNetLayer(nn.Module):
         v = self.v_norm(self.v_proj(x_eff).view(B, L, self.num_heads, self.head_dim))
 
         # Сферична L2-нормалізація Q та K у FP32 для гарантії ||k_t|| = 1 (спектральна стійкість)
-        q_fp32 = F.normalize(q.float(), p=2, dim=-1, eps=1e-5)
-        k_fp32 = F.normalize(k.float(), p=2, dim=-1, eps=1e-5)
+        # safe_l2_normalize усуває градієнтний спайк 100,000x при ||k|| -> 0
+        q_fp32 = safe_l2_normalize(q.float(), dim=-1, eps=1e-6)
+        k_fp32 = safe_l2_normalize(k.float(), dim=-1, eps=1e-6)
         v_fp32 = v.float()
 
         # Розрахунок динамічних гейтів затухання alpha та запису beta
-        alpha_fp32 = torch.sigmoid(self.alpha_proj(x_eff)).float()  # [B, L, 16]
+        # Обмеження alpha <= 0.9995 для усунення маргінальної нестійкості при насиченні Sigmoid
+        alpha_fp32 = (torch.sigmoid(self.alpha_proj(x_eff)) * 0.9995).float()  # [B, L, 16]
         beta_fp32 = torch.sigmoid(self.beta_proj(x_eff)).float()    # [B, L, 16]
 
         # --------------------------------------------------------------------

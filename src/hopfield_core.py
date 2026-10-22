@@ -171,6 +171,20 @@ class SLHCoreNCMAdapter(nn.Module):
         self.register_buffer("b2", torch.zeros(self.num_groups, self.codebook_size))
         self.register_buffer("prev_err1", torch.zeros(self.num_groups, self.codebook_size))
         self.register_buffer("prev_err2", torch.zeros(self.num_groups, self.codebook_size))
+        target_f1_init = self.topk_1 / float(self.codebook_size)
+        target_f2_init = self.topk_2 / float(self.codebook_size)
+        self.register_buffer("f1_ema", torch.full((self.num_groups, self.codebook_size), target_f1_init))
+        self.register_buffer("f2_ema", torch.full((self.num_groups, self.codebook_size), target_f2_init))
+
+        # Static 256-element LUT table for sub-millisecond CPU dequantization
+        decode_map = torch.tensor([0.0, 1.0, -1.0, 0.0], dtype=torch.float32)
+        lut = torch.zeros(256, 4, dtype=torch.float32)
+        for b in range(256):
+            lut[b, 0] = decode_map[b & 0x03]
+            lut[b, 1] = decode_map[(b >> 2) & 0x03]
+            lut[b, 2] = decode_map[(b >> 4) & 0x03]
+            lut[b, 3] = decode_map[(b >> 6) & 0x03]
+        self.register_buffer("lut_2bit", lut, persistent=False)
 
         # Bit shift constant for 2-bit vectorized decoding
         self.register_buffer(
@@ -290,33 +304,37 @@ class SLHCoreNCMAdapter(nn.Module):
 
     def _unpack_subtensor(self, g: int, idx1: torch.Tensor, idx2: torch.Tensor) -> torch.Tensor:
         """
-        Fast selective gathering and hardware dequantization of Top-32 active pairs.
-        Reads only 256 bytes per event per group instead of dequantizing the entire 128 MiB!
+        Fast selective gathering and hardware dequantization of active pairs.
+        Reads only 8 bytes per active pair per group.
         
         Args:
             g: Group index (0..15)
-            idx1: [B, K, topk_1] Top-8 indices from C1
-            idx2: [B, K, topk_2] Top-4 indices from C2
+            idx1: [B, K, topk_1] indices from C1
+            idx2: [B, K, topk_2] indices from C2
             
         Returns:
             v_unpacked: [B, K, topk_1, topk_2, val_dim] ternary micro-facts in {-1.0, 0.0, +1.0}
         """
-        B, K, _ = idx1.shape
+        B, K, dim1 = idx1.shape
+        dim2 = idx2.shape[-1]
         if not self.pack_2bit and self.V is not None:
             Vg = self.V[g]  # [1024, 1024, 32]
-            return Vg[idx1.unsqueeze(-1), idx2.unsqueeze(-2)]  # [B, K, 8, 4, 32]
+            return Vg[idx1.unsqueeze(-1), idx2.unsqueeze(-2)]
 
         # Packed 2-bit path: read 8 bytes per active (i, j) pair
         V_packed_g = self.V_packed[g]  # [1024, 1024, 8]
-        raw_bytes = V_packed_g[idx1.unsqueeze(-1), idx2.unsqueeze(-2)]  # [B, K, 8, 4, 8]
+        raw_bytes = V_packed_g[idx1.unsqueeze(-1), idx2.unsqueeze(-2)]  # [B, K, dim1, dim2, 8]
 
-        # Vectorized bit-shift dequantization
-        # shifts broadcast along last dimension: (raw_bytes >> [0, 2, 4, 6]) & 0x03
+        # Sub-microsecond LUT path if available
+        if hasattr(self, "lut_2bit") and self.lut_2bit is not None:
+            return self.lut_2bit[raw_bytes.long()].view(B, K, dim1, dim2, self.val_dim)
+
+        # Vectorized bit-shift dequantization fallback
         shifts = self.bit_shifts.to(raw_bytes.device)
-        codes = (raw_bytes.unsqueeze(-1) >> shifts) & 0x03  # [B, K, 8, 4, 8, 4]
+        codes = (raw_bytes.unsqueeze(-1) >> shifts) & 0x03
         # Decode: 0 -> 0.0, 1 -> +1.0, 2 -> -1.0
         v_unpacked = torch.where(codes == 2, -1.0, codes.to(torch.float32)).view(
-            B, K, self.topk_1, self.topk_2, self.val_dim
+            B, K, dim1, dim2, self.val_dim
         )
         return v_unpacked
 
@@ -418,23 +436,34 @@ class SLHCoreNCMAdapter(nn.Module):
                 idx1_flat = top1_idx.view(-1, self.num_groups, self.topk_1).permute(1, 0, 2).reshape(self.num_groups, -1)
                 val1_flat = ones1.view(-1, self.num_groups, self.topk_1).permute(1, 0, 2).reshape(self.num_groups, -1)
                 f1.scatter_add_(1, idx1_flat, val1_flat)
-                f1 = f1 / total_events
+                f1 = f1 / float(total_events)
 
                 ones2 = torch.ones_like(top2_idx, dtype=torch.float32)
                 idx2_flat = top2_idx.view(-1, self.num_groups, self.topk_2).permute(1, 0, 2).reshape(self.num_groups, -1)
                 val2_flat = ones2.view(-1, self.num_groups, self.topk_2).permute(1, 0, 2).reshape(self.num_groups, -1)
                 f2.scatter_add_(1, idx2_flat, val2_flat)
-                f2 = f2 / total_events
+                f2 = f2 / float(total_events)
 
                 target_f1 = self.topk_1 / float(self.codebook_size)
                 target_f2 = self.topk_2 / float(self.codebook_size)
 
-                # Normalized relative error
-                err1 = (f1 - target_f1) / target_f1
-                err2 = (f2 - target_f2) / target_f2
+                # Smooth EMA update (Low-Pass Filter) to eliminate high-frequency noise & derivative kick
+                ema_alpha = 0.05
+                self.f1_ema.mul_(1.0 - ema_alpha).add_(f1, alpha=ema_alpha)
+                self.f2_ema.mul_(1.0 - ema_alpha).add_(f2, alpha=ema_alpha)
 
-                d_err1 = err1 - self.prev_err1
-                d_err2 = err2 - self.prev_err2
+                # Normalized relative error (bounded to [-5.0, 5.0] to prevent bang-bang oscillations)
+                err1 = torch.clamp((self.f1_ema - target_f1) / target_f1, -5.0, 5.0)
+                err2 = torch.clamp((self.f2_ema - target_f2) / target_f2, -5.0, 5.0)
+
+                # Low-pass filtered derivative term (prevents phase lag and limit cycles)
+                d_err1 = 0.2 * (err1 - self.prev_err1)
+                d_err2 = 0.2 * (err2 - self.prev_err2)
+
+                # Leaky Integrator decay (prevents integrator windup during long dialogues)
+                leak_rate = 0.001
+                self.b1.mul_(1.0 - leak_rate)
+                self.b2.mul_(1.0 - leak_rate)
 
                 # PID update
                 self.b1.sub_(self.pid_ki * err1 + self.pid_kd * d_err1)
@@ -460,29 +489,60 @@ class SLHCoreNCMAdapter(nn.Module):
         # Compute Continuous Hopfield Network Energy
         hopfield_energy = self.compute_hopfield_energy(pair_scores_flat, q1, q2)  # [B, K, 16]
 
-        # 6. Bilinear Contraction with Ternary Attractor Tensor & TPU MXU Expansion
-        group_outputs = []
-        for g in range(self.num_groups):
-            idx1_g = top1_idx[..., g, :]        # [B, K, 8]
-            idx2_g = top2_idx[..., g, :]        # [B, K, 4]
-            weights_g = attn_weights[..., g, :]  # [B, K, 32]
+        # 6. Anti-Spurious Attractor Dynamics & Vectorized Attractor Retrieval
+        # Calculate per-group normalized Shannon entropy H in [0, 1]
+        log_attn = torch.log(attn_weights.clamp(min=1e-12))
+        entropy_g = - (attn_weights * log_attn).sum(dim=-1) / math.log(32.0)  # [B, K, 16]
+        attn_var_g = torch.var(attn_weights, dim=-1)  # [B, K, 16]
 
-            # Selective subtensor extraction (2-bit or FP32)
-            V_sub = self._unpack_subtensor(g, idx1_g, idx2_g)  # [B, K, 8, 4, 32]
-            V_sub_flat = V_sub.view(B, K, self.topk_1 * self.topk_2, self.val_dim)  # [B, K, 32, 32]
+        # Group-level jamming gate: suppresses dynamic micro-facts when trapped in uniform spurious superposition
+        # Smooth sigmoid gate: 0.0 when selective, 1.0 when jammed
+        spurious_jammed_g = (entropy_g > 0.95) | (attn_var_g < 1e-5)
+        jam_gate_g = torch.sigmoid((entropy_g - 0.94) * 40.0)  # [B, K, 16]
 
-            # Weighted attractor retrieval (32-dim micro-fact) via BLAS GEMM
-            m_dyn = (weights_g.unsqueeze(-2) @ V_sub_flat).squeeze(-2)  # [B, K, 32]
+        if self.pack_2bit and hasattr(self, "lut_2bit") and self.lut_2bit is not None and self.V_packed is not None:
+            # High-performance Vectorized LUT path across all 16 groups (Sub-millisecond)
+            g_idx_all = torch.arange(self.num_groups, device=blueprint_B_k.device).view(1, 1, self.num_groups, 1, 1)
+            raw_bytes = self.V_packed[g_idx_all, top1_idx.unsqueeze(-1), top2_idx.unsqueeze(-2)]  # [B, K, 16, 8, 4, 8]
+            v_all = self.lut_2bit[raw_bytes.long()].view(B, K, self.num_groups, 32, self.val_dim)  # [B, K, 16, 32, 32]
+            
+            # Weighted attractor retrieval (32-dim micro-facts)
+            m_dyn = torch.einsum('bkgs,bkgsv->bkgv', attn_weights, v_all)  # [B, K, 16, 32]
+            
+            # Isolate spurious attractors per-group: attenuate dynamic vector towards zero, falling back to anchor V_shared
+            m_dyn_safe = m_dyn * (1.0 - jam_gate_g.unsqueeze(-1))
+            
+            # Linear systolic expansion 32 -> 128 (TPU MXU alignment)
+            m_expanded = torch.einsum('bkgv,gvd->bkgd', m_dyn_safe, self.W_expand)  # [B, K, 16, 128]
+            
+            # Add shared anchor baseline
+            m_g = m_expanded + self.V_shared.view(1, 1, self.num_groups, self.expanded_dim)  # [B, K, 16, 128]
+            m_concat = m_g.reshape(B, K, self.num_groups * self.expanded_dim)  # [B, K, 2048]
+        else:
+            # Fallback path (FP32 training parameter V or sequential)
+            group_outputs = []
+            for g in range(self.num_groups):
+                idx1_g = top1_idx[..., g, :]        # [B, K, 8]
+                idx2_g = top2_idx[..., g, :]        # [B, K, 4]
+                weights_g = attn_weights[..., g, :]  # [B, K, 32]
 
-            # Linear systolic expansion 32 -> 128 (TPU MXU alignment) via BLAS GEMM
-            m_expanded = m_dyn @ self.W_expand[g]  # [B, K, 128]
+                # Selective subtensor extraction (2-bit or FP32)
+                V_sub = self._unpack_subtensor(g, idx1_g, idx2_g)  # [B, K, 8, 4, 32]
+                V_sub_flat = V_sub.view(B, K, self.topk_1 * self.topk_2, self.val_dim)  # [B, K, 32, 32]
 
-            # Add shared anchor attractor baseline
-            m_g = m_expanded + self.V_shared[g].unsqueeze(0).unsqueeze(0)  # [B, K, 128]
-            group_outputs.append(m_g)
+                # Weighted attractor retrieval (32-dim micro-fact)
+                m_dyn = (weights_g.unsqueeze(-2) @ V_sub_flat).squeeze(-2)  # [B, K, 32]
+                m_dyn_safe = m_dyn * (1.0 - jam_gate_g[..., g].unsqueeze(-1))
 
-        # Concatenate across all 16 groups: [B, K, 16 * 128 = 2048]
-        m_concat = torch.cat(group_outputs, dim=-1)
+                # Linear systolic expansion 32 -> 128 (TPU MXU alignment)
+                m_expanded = m_dyn_safe @ self.W_expand[g]  # [B, K, 128]
+
+                # Add shared anchor attractor baseline
+                m_g = m_expanded + self.V_shared[g].unsqueeze(0).unsqueeze(0)  # [B, K, 128]
+                group_outputs.append(m_g)
+
+            # Concatenate across all 16 groups: [B, K, 16 * 128 = 2048]
+            m_concat = torch.cat(group_outputs, dim=-1)
 
         # Project back to model hidden dimension: 2048 -> 1536
         y_factual_context = self.out_proj(m_concat)  # [B, K, 1536]
@@ -506,10 +566,8 @@ class SLHCoreNCMAdapter(nn.Module):
 
         # 8. Optional Phase 3 Word Decoder Gating Bridge with Anti-Jamming Isolation
         final_output = y_factual_context
-        # Detect spurious attractor jamming (uniform attention distribution across active slots)
-        attn_var = torch.var(attn_weights, dim=-1) # [B, K, 16]
-        spurious_jammed = (attn_var < 1e-6)
-        is_jammed_global = spurious_jammed.all().item()
+        # Detect spurious attractor jamming (global indicator when > 50% groups jammed)
+        is_jammed_global = (spurious_jammed_g.float().mean().item() > 0.5)
 
         if phase3_decoder_state is not None:
             # Align context with decoder length via pooling or identity
@@ -519,6 +577,10 @@ class SLHCoreNCMAdapter(nn.Module):
                 context_pool = y_factual_context
             gate_input = torch.cat([phase3_decoder_state, context_pool], dim=-1)
             g_fact = torch.sigmoid(self.anchor_gate(gate_input))
+            # If memory is jammed with spurious attractors, attenuate factual gate to isolate decoder
+            if is_jammed_global:
+                g_fact = g_fact * 0.0  # Decouple poisoned memory
+            final_output = (1.0 - g_fact) * phase3_decoder_state + g_fact * context_pool
             # If memory is jammed with spurious attractors, attenuate factual gate to isolate decoder
             if is_jammed_global:
                 g_fact = g_fact * 0.0  # Decouple poisoned memory
@@ -542,7 +604,9 @@ class SLHCoreNCMAdapter(nn.Module):
             "router_b1_mean": self.b1.mean().item(),
             "router_b2_mean": self.b2.mean().item(),
             "spurious_jamming_detected": is_jammed_global,
-            "attn_variance_mean": attn_var.mean().item()
+            "attn_variance_mean": attn_var_g.mean().item(),
+            "spurious_jammed_groups": spurious_jammed_g,
+            "entropy_mean": entropy_g.mean().item()
         }
 
         return final_output, commit_loss, diagnostics
@@ -588,16 +652,28 @@ class SLHCoreNCMAdapter(nn.Module):
             i_star = int(torch.argmax(s1).item())
             j_star = int(torch.argmax(s2).item())
 
-        # 2. Project target 128-dim fact into 32-dim micro-fact via pseudo-inverse W_expand^T
+        # 2. Centering against shared anchor attractor baseline
         fact_128 = factual_vector_128.reshape(-1)
-        W_exp = self.W_expand[group_id]  # [32, 128]
-        v_target_32 = torch.mv(W_exp, fact_128)
+        target_centered = fact_128 - self.V_shared[group_id]
 
-        # 3. Absmean 1.58-bit ternary quantization: {-1.0, 0.0, +1.0}
+        # 3. Tikhonov Regularized Pseudoinversion (Damped Least Squares / Ridge)
+        #    W_exp has shape [32, 128]. Solves for v_target_32 such that:
+        #    v_target_32 @ W_exp ≈ target_centered
+        #    v = target_centered @ W^+ = (W W^T + lambda * I)^(-1) @ W @ target_centered
+        #    Guarantees numerical stability even when condition number kappa(W W^T) -> infinity!
+        W_exp = self.W_expand[group_id]  # [32, 128]
+        G = torch.mm(W_exp, W_exp.t())   # Gramian matrix [32, 32]
+        trace_val = torch.trace(G).item()
+        lambda_reg = max(1e-4 * (trace_val / 32.0), 1e-5)
+        damped_G = G + lambda_reg * torch.eye(32, device=W_exp.device, dtype=W_exp.dtype)
+        rhs = torch.mv(W_exp, target_centered)
+        v_target_32 = torch.linalg.solve(damped_G, rhs)  # [32]
+
+        # 4. Absmean 1.58-bit ternary quantization: {-1.0, 0.0, +1.0}
         gamma = torch.mean(torch.abs(v_target_32)).clamp(min=1e-5)
         v_ternary = torch.clamp(torch.round(v_target_32 / gamma), -1.0, 1.0)
 
-        # 4. In-place memory write
+        # 5. In-place memory write
         if hasattr(self, "V") and self.V is not None:
             self.V[group_id, i_star, j_star, :].copy_(v_ternary)
 

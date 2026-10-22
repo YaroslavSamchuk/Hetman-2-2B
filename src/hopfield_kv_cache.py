@@ -41,6 +41,11 @@ OUTLIER_THRESHOLD_MAHAL: float = 3.25 # Mahalanobis distance discriminator thres
 ATTRACTOR_MERGE_SIM_COS: float = 0.88 # Cosine similarity threshold for attractor clustering
 LOG_CLUSTER_SIZE: float = math.log(float(TOKENS_PER_CLUSTER))  # ln(32) ≈ 3.4657359
 
+# Numerical stability barriers (Audit #12)
+EPS_DISPERSION_FLOOR: float = 1e-4        # Minimum numerical floor for dispersion (avoids ZeroDivisionError)
+QUANT_NOISE_FLOOR: float = 0.005          # INT8 quantization noise floor (protects against Anomaly Collapse)
+RECENCY_PROTECT_RATIO: float = 0.15       # Protect most recent 15% attractors from compaction
+
 
 # ==============================================================================
 # 2. FP8 / INT8 Quantization Helpers (Zero-Allocation Simulation)
@@ -116,8 +121,10 @@ class AttractorCentroid:
     mu_k_scales: torch.Tensor   # [NUM_GLOBAL_LAYERS, NUM_KV_HEADS] float32
     mu_v_scales: torch.Tensor   # [NUM_GLOBAL_LAYERS, NUM_KV_HEADS] float32
     dispersion: torch.Tensor    # [NUM_GLOBAL_LAYERS, NUM_KV_HEADS] float32 (sigma_c^2)
+    m2_k: Optional[torch.Tensor] = None # Sum of squared deviations for Welford
     token_count: int = 1        # Mass n_c
     last_access_timestamp: int = 0
+    creation_timestamp: int = 0
     flags: int = 0
 
 
@@ -210,9 +217,10 @@ def variance_compensated_softmax(
         # Dot product: <q, mu_k> / sqrt(d)
         logits_att = torch.matmul(q, mu_k_rep.transpose(-1, -2)) * base_scale  # [B, H_q, 1, M]
 
-        # Temperature scaling via variance: (1 + sigma_c^2 / (2 * D))
+        # Temperature scaling via variance: (1 + sigma_c^2 / (2 * D)) with non-negative clamp
         if sigma2_k is not None:
-            sigma2_rep = sigma2_k.repeat_interleave(gqa_ratio, dim=1).unsqueeze(2)  # [B, H_q, 1, M]
+            safe_sigma2 = torch.clamp(sigma2_k, min=0.0)
+            sigma2_rep = safe_sigma2.repeat_interleave(gqa_ratio, dim=1).unsqueeze(2)  # [B, H_q, 1, M]
             temp_scale = 1.0 + (sigma2_rep / (2.0 * float(D)))
             logits_att = logits_att * temp_scale
 
@@ -452,11 +460,12 @@ class HopfieldKVCache:
         best_sim, best_idx = torch.max(cos_sims, dim=0)
         best_att_idx = int(best_idx.item())
 
-        # Euclidean distance squared to nearest attractor
-        diff = k_fp32 - mu_k_tensor[best_att_idx]
+        # Euclidean distance squared to nearest attractor centroid
+        diff = k_fp32 - mu_k_list[best_att_idx]
         dist_sq = torch.sum(diff ** 2).item()
 
-        disp = float(self.attractors[best_att_idx].dispersion[0, 0].item()) + 1e-4
+        # Numerically safe dispersion (strictly non-negative floor against ZeroDivisionError & FP32 negative dispersion)
+        disp = max(float(self.attractors[best_att_idx].dispersion[0, 0].item()), 1e-4)
         mahalanobis = dist_sq / disp
 
         # If token belongs to the nearest attractor's semantic topic:
@@ -495,10 +504,11 @@ class HopfieldKVCache:
                 matched = True
 
         if matched:
-            # Incremental Welford update
+            # Incremental Welford update with non-negative clamping & M2 tracking
             att = self.attractors[best_idx]
-            new_n = att.token_count + 1
-            att.token_count = min(new_n, 65535)
+            old_n = att.token_count
+            new_n = min(old_n + 1, 65535)
+            att.token_count = new_n
             att.last_access_timestamp = self.global_timestamp
 
             # Dequantize current centroids
@@ -512,9 +522,15 @@ class HopfieldKVCache:
             delta_v = v_fp32 - cur_mu_v
             updated_mu_v = cur_mu_v + delta_v / float(new_n)
 
-            # Update dispersion sigma^2 = (1/n) * sum ||k_i - mu||^2
-            sq_diff_k = torch.sum((k_fp32 - updated_mu_k) ** 2, dim=-1)  # [L, H_kv]
-            att.dispersion = att.dispersion + (sq_diff_k - att.dispersion) / float(new_n)
+            # Welford update for M2 and dispersion:
+            # delta_k_new = k - updated_mu_k
+            # M2_new = M2_old + sum(delta_k * delta_k_new)
+            delta_k_new = k_fp32 - updated_mu_k
+            cross_diff = torch.sum(delta_k * delta_k_new, dim=-1)  # [L, H_kv]
+            if att.m2_k is None:
+                att.m2_k = att.dispersion * float(old_n)
+            att.m2_k = torch.clamp(att.m2_k + cross_diff, min=0.0)
+            att.dispersion = torch.clamp(att.m2_k / float(new_n), min=0.0)
 
             # Re-quantize and store
             att.mu_k_quant, att.mu_k_scales = quantize_symmetric_int8(updated_mu_k)
@@ -525,37 +541,66 @@ class HopfieldKVCache:
                 self.compact_history()
 
             init_disp = torch.full((self.num_layers, self.num_kv_heads), 0.05, device=self.device)
+            init_m2 = init_disp.clone()
             new_att = AttractorCentroid(
                 mu_k_quant=slot.k_quant.clone(),
                 mu_v_quant=slot.v_quant.clone(),
                 mu_k_scales=slot.k_scales.clone(),
                 mu_v_scales=slot.v_scales.clone(),
                 dispersion=init_disp,
+                m2_k=init_m2,
                 token_count=1,
-                last_access_timestamp=self.global_timestamp
+                last_access_timestamp=self.global_timestamp,
+                creation_timestamp=self.global_timestamp
             )
             self.attractors.append(new_att)
 
     def compact_history(self) -> None:
         """
         Defragmentation and pairwise merge of the two closest attractors when reaching capacity.
-        Preserves total context coverage without dynamic allocation.
+        Implements:
+          1. Recency Protection: Protects the most recent 15% of attractors from eviction/merging.
+          2. Cosine Similarity Gating: Merges only if cos_sim >= merge_sim_cos (0.88).
+          3. Huygens-Steiner Parallel Dispersion: Exact pooled variance without arbitrary inflation.
         """
-        if len(self.attractors) < 2:
+        total_m = len(self.attractors)
+        if total_m < 2:
             return
 
-        # Find pair with highest cosine similarity
+        # 1. Recency Protection: do not merge newest attractors
+        protect_count = max(int(total_m * RECENCY_PROTECT_RATIO), 1)
+        eligible_count = total_m - protect_count
+        if eligible_count < 2:
+            eligible_count = total_m
+
+        # Find pair with highest cosine similarity among eligible attractors
         mu_k_list = [
-            dequantize_symmetric_int8(att.mu_k_quant[0, 0], att.mu_k_scales[0, 0])
-            for att in self.attractors
+            dequantize_symmetric_int8(self.attractors[i].mu_k_quant[0, 0], self.attractors[i].mu_k_scales[0, 0])
+            for i in range(eligible_count)
         ]
         mu_k_tensor = F.normalize(torch.stack(mu_k_list, dim=0), p=2, dim=-1)
         sim_matrix = torch.matmul(mu_k_tensor, mu_k_tensor.T)
         sim_matrix.fill_diagonal_(-1.0)
 
         max_sim, flat_idx = torch.max(sim_matrix.view(-1), dim=0)
-        idx_i = int(flat_idx.item()) // len(self.attractors)
-        idx_j = int(flat_idx.item()) % len(self.attractors)
+        idx_i = int(flat_idx.item()) // eligible_count
+        idx_j = int(flat_idx.item()) % eligible_count
+
+        # Fallback if no pair meets similarity threshold: evict oldest least-frequently accessed attractor
+        if max_sim.item() < self.merge_sim_cos:
+            oldest_idx = 0
+            min_score = float('inf')
+            for i in range(eligible_count):
+                score = self.attractors[i].token_count * 1000 + self.attractors[i].last_access_timestamp
+                if score < min_score:
+                    min_score = score
+                    oldest_idx = i
+            self.attractors.pop(oldest_idx)
+            return
+
+        # Ensure idx_i < idx_j for deterministic merging
+        if idx_i > idx_j:
+            idx_i, idx_j = idx_j, idx_i
 
         # Merge attractor j into attractor i
         att_i = self.attractors[idx_i]
@@ -573,18 +618,22 @@ class HopfieldKVCache:
         mu_v_j = dequantize_symmetric_int8(att_j.mu_v_quant, att_j.mu_v_scales)
         merged_mu_v = (mu_v_i * n_i + mu_v_j * n_j) / float(n_total)
 
-        # Combined dispersion
-        merged_disp = (att_i.dispersion * n_i + att_j.dispersion * n_j) / float(n_total) + 0.02
+        # Huygens-Steiner exact pooled variance:
+        # sigma_total^2 = (n_i * sigma_i^2 + n_j * sigma_j^2) / n_total + (n_i * n_j / n_total^2) * ||mu_i - mu_j||^2
+        diff_mu_sq = torch.sum((mu_k_i - mu_k_j) ** 2, dim=-1)
+        between_cluster_var = (float(n_i * n_j) / float(n_total ** 2)) * diff_mu_sq
+        within_cluster_var = (att_i.dispersion * n_i + att_j.dispersion * n_j) / float(n_total)
+        merged_disp = torch.clamp(within_cluster_var + between_cluster_var, min=0.0)
 
         att_i.mu_k_quant, att_i.mu_k_scales = quantize_symmetric_int8(merged_mu_k)
         att_i.mu_v_quant, att_i.mu_v_scales = quantize_symmetric_int8(merged_mu_v)
         att_i.dispersion = merged_disp
+        att_i.m2_k = merged_disp * float(n_total)
         att_i.token_count = min(n_total, 65535)
         att_i.last_access_timestamp = max(att_i.last_access_timestamp, att_j.last_access_timestamp)
 
-        # Swap with last element and pop (O(1) deletion)
-        self.attractors[idx_j] = self.attractors[-1]
-        self.attractors.pop()
+        # Remove attractor j without disrupting ordering of remaining elements
+        self.attractors.pop(idx_j)
 
     # --------------------------------------------------------------------------
     # Retrieval API: query_attractors for GQA
@@ -896,13 +945,13 @@ class AttractorAugmentedAttention(nn.Module):
         mu_k = AttractorSTE.apply(k_blocks, 3)  # [B, H_kv, num_clusters, D]
         mu_v = torch.mean(v_blocks, dim=3)      # [B, H_kv, num_clusters, D]
 
-        # Intra-cluster dispersion: sigma_c^2
+        # Intra-cluster dispersion: sigma_c^2 (non-negative clamped)
         diff_k = k_blocks - mu_k.unsqueeze(3)
-        sigma2_c = torch.mean(torch.sum(diff_k ** 2, dim=-1), dim=3)  # [B, H_kv, num_clusters]
+        sigma2_c = torch.clamp(torch.mean(torch.sum(diff_k ** 2, dim=-1), dim=3), min=0.0)  # [B, H_kv, num_clusters]
 
-        # Noise injection during training
+        # Noise injection during training (protected against negative dispersion / NaN)
         if is_training and self.noise_std > 0.0:
-            noise = torch.randn_like(mu_k) * (self.noise_std * torch.sqrt(sigma2_c / float(self.head_dim)).unsqueeze(-1))
+            noise = torch.randn_like(mu_k) * (self.noise_std * torch.sqrt(torch.clamp(sigma2_c, min=0.0) / float(self.head_dim)).unsqueeze(-1))
             mu_k = mu_k + noise
 
         # Temperature scaling factor: (1 + sigma_c^2 / (2 * D))

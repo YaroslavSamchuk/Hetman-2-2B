@@ -10,6 +10,8 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <cmath>
+#include <bit>
 #include <span>
 #include <array>
 #include <string_view>
@@ -186,13 +188,18 @@ struct alignas(RADA_NCM_CACHE_LINE) RadaBlockDecodeWorkspace {
 
 // Глобальний KV-кеш для 6 шарів Softmax (FP8 E4M3)
 struct alignas(RADA_NCM_CACHE_LINE) RadaGlobalKVCache {
-    alignas(RADA_NCM_CACHE_LINE) uint8_t buffer[BYTES_GLOBAL_KV_CACHE];
-    size_t current_seq_len;
+    uint32_t current_seq_len;
+    uint32_t max_seq_len;
+    uint8_t  reserved[56]; // 64-байтне вирівнювання службового заголовка
+    alignas(RADA_NCM_CACHE_LINE) uint8_t buffer[BYTES_GLOBAL_KV_CACHE - 64];
 
     void reset() noexcept {
         current_seq_len = 0;
     }
 };
+
+static_assert(sizeof(RadaGlobalKVCache) == BYTES_GLOBAL_KV_CACHE,
+              "RadaGlobalKVCache must exactly match BYTES_GLOBAL_KV_CACHE!");
 
 // Параметри запуску генерації
 struct GenerationConfig {
@@ -259,6 +266,48 @@ struct RadaExecutionContext {
     float                      scale_k,
     float                      scale_v
 ) noexcept;
+
+// =================================================================================================
+// ШВИДКА ЕКСПОНЕНТА ДЛЯ SOFTMAX: ПОЛІНОМ РЕМЕЗА 5-ГО ПОРЯДКУ (ЧИСЕЛЬНО БЕЗПЕЧНА)
+// =================================================================================================
+
+struct RemezExp5 {
+    // Коефіцієнти мінімаксного полінома Ремеза 5-го порядку для 2^f на [0, 1)
+    static constexpr float C0 = 1.0000000000f;
+    static constexpr float C1 = 0.6931471806f;
+    static constexpr float C2 = 0.2402265070f;
+    static constexpr float C3 = 0.0555041087f;
+    static constexpr float C4 = 0.0096181291f;
+    static constexpr float C5 = 0.0013333558f;
+
+    [[nodiscard]] static inline float eval(float x) noexcept {
+        // Чисельний захист від NaN та запобігання підпороговому переповненню в -inf / від'ємні числа
+        // При x <= -87.33f значення менше за FLT_MIN (~1.17e-38); у Softmax logit diff <-50.0f
+        // робить внесок < 1.93e-22, що є нехтовним порівняно з машинною точністю float32 (1.19e-7).
+        if (std::isnan(x) || x <= -87.3365f) return 0.0f;
+        if (x >= 87.3365f) return 3.40282347e+38f; // FLT_MAX
+
+        float t = x * 1.4426950408889634f; // x * log2(e)
+        float fi = std::floor(t);
+        float f = t - fi;
+        int i = static_cast<int>(fi);
+
+        // Схема Горнера для 5-го порядку (максимальна абсолютна похибка eps < 1.2e-7)
+        float p = C0 + f * (C1 + f * (C2 + f * (C3 + f * (C4 + f * C5))));
+
+        // Безпечний бітовий зсув експоненти IEEE-754 (без UB та без strict aliasing порушень)
+        uint32_t exp_bits = static_cast<uint32_t>(i + 127) << 23;
+        #if defined(__cpp_lib_bit_cast) && __cpp_lib_bit_cast >= 201806L
+        float scale = std::bit_cast<float>(exp_bits);
+        #else
+        union { uint32_t u; float f; } cvt;
+        cvt.u = exp_bits;
+        float scale = cvt.f;
+        #endif
+
+        return p * scale;
+    }
+};
 
 // =================================================================================================
 // ГОЛОВНИЙ КЛАС ІНФЕРЕНС-РУШІЯ RADA.CPP NCM

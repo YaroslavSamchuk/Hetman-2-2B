@@ -168,6 +168,10 @@ class FastWalshHadamardTransform(nn.Module):
         d = orig_shape[-1]
         assert d % self.block_size == 0, f"Last dimension {d} must be a multiple of {self.block_size}"
 
+        # 0. Quarantine / Self-Healing against NaN / Inf contamination
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            x = torch.nan_to_num(x, nan=0.0, posinf=self.eta_max, neginf=-self.eta_max)
+
         # 1. Forward FWHT rotation
         x_rot = blockwise_fwht_forward(x, block_size=self.block_size, normalize=True)
 
@@ -181,9 +185,11 @@ class FastWalshHadamardTransform(nn.Module):
 
         # 3. Dynamic INT8 quantization & dequantization (STE emulation)
         scale = 127.0 / eta_clamped
+        x_scaled = x_rot * scale
         # Clamped strictly to [-127.0, 127.0] to prevent the -128 two's complement negation bug
-        x_quant = torch.clamp(torch.round(x_rot * scale), -127.0, 127.0)
-        x_dequant = x_quant * (eta_clamped / 127.0)
+        x_quant = torch.clamp(torch.round(x_scaled), -127.0, 127.0)
+        x_quant_ste = x_scaled + (x_quant - x_scaled).detach()
+        x_dequant = x_quant_ste * (eta_clamped / 127.0)
 
         # 4. Inverse FWHT (FWHT is self-inverse due to orthogonal symmetry)
         x_inv = blockwise_fwht_forward(x_dequant, block_size=self.block_size, normalize=True)
@@ -217,6 +223,9 @@ class AbsmeanWeightQuantizer(torch.autograd.Function):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         orig_dtype = weight.dtype
         w_f32 = weight.to(torch.float32)
+        # Quarantine corrupted weights before absmean computation
+        if torch.isnan(w_f32).any() or torch.isinf(w_f32).any():
+            w_f32 = torch.nan_to_num(w_f32, nan=0.0, posinf=1.0, neginf=-1.0)
         # Step 1: Compute per-tensor mean absolute scale gamma in FP32 for stability
         gamma = torch.mean(torch.abs(w_f32)).clamp(min=eps)
         # Step 2: Normalize and round to {-1, 0, +1}
@@ -488,6 +497,10 @@ class BitLinear(nn.Module):
         nn.init.uniform_(self.weight, -math.sqrt(3) * std, math.sqrt(3) * std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Step 0: Input numerical quench against NaN / Inf corruption
+        if torch.isnan(x).any() or torch.isinf(x).any():
+            x = torch.nan_to_num(x, nan=0.0, posinf=self.eta_max, neginf=-self.eta_max)
+
         # Step 1: Sub-Layer RMSNorm
         if self.rms_norm is not None:
             x_norm = self.rms_norm(x)

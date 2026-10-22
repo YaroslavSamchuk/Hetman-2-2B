@@ -103,9 +103,12 @@ class FastWalshHadamardTransform(nn.Module):
         eta = torch.amax(torch.abs(x_rot), dim=-1, keepdim=True) + 1e-5
         eta_clamped = torch.clamp(eta, self.eta_min, self.eta_max)
 
-        # Simulated INT8 quantization & dequantization
-        x_quant = torch.clamp(torch.round(x_rot * (127.0 / eta_clamped)), -128.0, 127.0)
-        x_dequant = x_quant * (eta_clamped / 127.0)
+        # Simulated INT8 quantization & dequantization with Straight-Through Estimator (STE)
+        scale = 127.0 / eta_clamped
+        x_scaled = x_rot * scale
+        x_quant = torch.clamp(torch.round(x_scaled), -128.0, 127.0)
+        x_quant_ste = x_scaled + (x_quant - x_scaled).detach()
+        x_dequant = x_quant_ste * (eta_clamped / 127.0)
 
         # Inverse FWHT (FWHT is self-inverse due to orthogonal symmetry)
         x_inv = self._fwht_butterfly(x_dequant)
@@ -194,15 +197,20 @@ class SemanticDeduplicationFilter(nn.Module):
         B, K, L_c, d = H.shape
         c, M_orig = self.compute_similarity_matrix(H)
 
-        H_out = H.clone()
+        # Accumulate additive delta for each chunk to avoid in-place slice mutation on H and c
+        delta_H_list = []
         repulsion_events = 0
 
         # Sequential chronological pass across block pairs (i < j)
         for b in range(B):
+            # List of centroid vectors for batch b: out-of-place updates
+            c_b = [c[b, k] for k in range(K)]
+            deltas_b = [torch.zeros(L_c, d, device=H.device, dtype=H.dtype) for _ in range(K)]
+
             for i in range(K):
                 for j in range(i + 1, K):
-                    c_i = c[b, i]
-                    c_j = c[b, j]
+                    c_i = c_b[i]
+                    c_j = c_b[j]
 
                     # Dynamic cosine similarity between updated centroids with safe norm clamping
                     c_i_norm = torch.norm(c_i, p=2).clamp(min=self.eps)
@@ -236,11 +244,16 @@ class SemanticDeduplicationFilter(nn.Module):
                             # Retain full vector magnitude
                             delta_c = delta_c + (noise_ortho / noise_norm) * c_j_norm
 
-                        # Broadcast semantic displacement across all tokens in Chunk j
-                        H_out[b, j] = H_out[b, j] + delta_c.unsqueeze(0)
+                        # Update running centroid out-of-place (new tensor assignment in list)
+                        c_b[j] = c_b[j] + delta_c
 
-                        # Update running centroid for subsequent chronological comparisons
-                        c[b, j] = H_out[b, j].mean(dim=0)
+                        # Accumulate displacement for chunk j
+                        deltas_b[j] = deltas_b[j] + delta_c.unsqueeze(0)
+
+            delta_H_list.append(torch.stack(deltas_b, dim=0))
+
+        delta_H = torch.stack(delta_H_list, dim=0)
+        H_out = H + delta_H
 
         if is_3d:
             H_out = H_out.squeeze(2)
@@ -309,7 +322,8 @@ class BoundarySeamSmoother(nn.Module):
         if K <= 1:
             return H.squeeze(2) if is_3d else H
 
-        H_out = H.clone()
+        # Accumulate updates out-of-place to protect autograd computation graph
+        delta_H = torch.zeros_like(H)
 
         for k in range(K - 1):
             h_exit = H[:, k, -1, :]        # [B, d] Exit token of chunk k
@@ -324,28 +338,28 @@ class BoundarySeamSmoother(nn.Module):
             cos_trans = torch.sum(u_norm * v_norm, dim=-1, keepdim=True)  # [B, 1]
 
             # Contrast preservation factor: drops towards 0 on sharp dialectical contrast
+            # Kept as [B, 1] to properly broadcast with [B, d] across any batch size B >= 1
             alpha_trans = torch.sigmoid(
                 (cos_trans - self.contrast_threshold) / self.transition_temp
-            ).unsqueeze(1)  # [B, 1, 1]
+            )  # [B, 1]
 
             bridge = 0.5 * (u_k + v_next)
             diff_fwd = bridge - h_entry
             diff_bwd = bridge - h_exit
 
-            gate = self.bridge_gate(torch.cat([u_k, v_next], dim=-1))
+            gate = self.bridge_gate(torch.cat([u_k, v_next], dim=-1)) # [B, d]
 
             effective_window = min(self.window_size, L_c)
             for m in range(effective_window):
                 decay = math.exp(-m / self.lambda_decay)
                 # Modulated by alpha_trans to protect section boundaries
-                H_out[:, k + 1, m, :] = (
-                    H_out[:, k + 1, m, :] + decay * alpha_trans * gate * diff_fwd
-                )
+                update_fwd = decay * alpha_trans * gate * diff_fwd
+                delta_H[:, k + 1, m, :] = delta_H[:, k + 1, m, :] + update_fwd
                 if L_c - 1 - m >= 0:
-                    H_out[:, k, L_c - 1 - m, :] = (
-                        H_out[:, k, L_c - 1 - m, :]
-                        + decay * alpha_trans * (1.0 - gate) * diff_bwd
-                    )
+                    update_bwd = decay * alpha_trans * (1.0 - gate) * diff_bwd
+                    delta_H[:, k, L_c - 1 - m, :] = delta_H[:, k, L_c - 1 - m, :] + update_bwd
+
+        H_out = H + delta_H
 
         if is_3d:
             H_out = H_out.squeeze(2)

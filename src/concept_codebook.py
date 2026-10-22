@@ -68,6 +68,7 @@ class SemanticScale(str, Enum):
     L0_GLOBAL_DISCOURSE = "L0_GLOBAL_DISCOURSE"  # Глобальний семантичний дискурс
     L1_SYNTAX = "L1_SYNTAX"                      # Синтаксичний скелет і зв'язність
     L2_SURFACE_TOKENS = "L2_SURFACE_TOKENS"      # Поверхнева лексична реалізація
+    L3_SUB_SCALE = "L3_SUB_SCALE"                # Суб-масштаб / мікро-семантика 4-го рівня
 
 
 SEMANTIC_SCALE_DESCRIPTIONS: Dict[SemanticScale, str] = {
@@ -82,6 +83,10 @@ SEMANTIC_SCALE_DESCRIPTIONS: Dict[SemanticScale, str] = {
     SemanticScale.L2_SURFACE_TOKENS: (
         "L2: Поверхневі токени — морфологічні закінчення, відмінкові узгодження "
         "слов'янської морфології, конкретна лексична емісія токенів."
+    ),
+    SemanticScale.L3_SUB_SCALE: (
+        "L3: Суб-масштаб — мікро-семантика, залишкові фонетико-стилістичні нюанси "
+        "та високочастотна деталізація представлення."
     ),
 }
 
@@ -199,8 +204,8 @@ class VectorQuantizerEMA(nn.Module):
         # Матриця центроїдів реєструється як параметр (без градієнтів при чистому EMA)
         self.embedding = nn.Parameter(init_weight, requires_grad=False)
 
-        # Буфери стану EMA
-        self.register_buffer("ema_cluster_size", torch.zeros(codebook_size, dtype=torch.float32))
+        # Буфери стану EMA (ініціалізація одиницями усуває сингулярність знаменника на кроці 0)
+        self.register_buffer("ema_cluster_size", torch.ones(codebook_size, dtype=torch.float32))
         self.register_buffer("ema_w", self.embedding.data.clone().to(torch.float32))
         self.register_buffer("usage_counts", torch.zeros(codebook_size, dtype=torch.float32))
         self.register_buffer("step_counter", torch.zeros(1, dtype=torch.int64))
@@ -276,7 +281,11 @@ class VectorQuantizerEMA(nn.Module):
                     min_dist = dist.min(dim=-1).values + 1e-8
 
                 # Нормалізація ймовірностей за законом K-Means++
-                probs = min_dist / min_dist.sum()
+                dist_sum = min_dist.sum()
+                if dist_sum < 1e-8:
+                    probs = torch.ones_like(min_dist) / num_candidates
+                else:
+                    probs = min_dist / dist_sum
 
                 # Семплювання індексів
                 replacement = num_candidates < num_dead
@@ -294,18 +303,19 @@ class VectorQuantizerEMA(nn.Module):
 
             new_centroids = flat_x[sampled_batch_indices].clone().float()
 
-            # Додавання мікрошуму xi ~ N(0, 1e-4 * I) проти ідентичних дублікатів (spec 01, eq. 296)
-            jitter = torch.randn_like(new_centroids) * 1e-4
+            # Додавання адаптивного шуму проти ідентичних дублікатів (захист від кластеризації залишків)
+            # Масштаб шуму адаптовано для уникнення катастрофічного скорочення FP32 (cancellation precision)
+            batch_std = flat_x.std().clamp(min=1e-2).item()
+            jitter_scale = max(1e-2, 0.05 * batch_std)
+            jitter = torch.randn_like(new_centroids) * jitter_scale
             new_centroids = new_centroids + jitter
 
             if self.spherical:
                 new_centroids = F.normalize(new_centroids, p=2, dim=-1)
 
             # Перезапуск ваг і лічильників EMA для реанімованих центроїдів
+            # Фіксація revive_count = 1.0 запобігає маскуванню мертвих кодів під час наступних кроків
             revive_count = 1.0
-            if active_indices.numel() > 0:
-                mean_size = self.ema_cluster_size[active_indices].mean().clamp(min=1.0).item()
-                revive_count = min(mean_size, 10.0)
 
             self.embedding.data[dead_indices] = new_centroids.to(self.embedding.dtype)
             self.ema_cluster_size[dead_indices] = revive_count
@@ -351,15 +361,18 @@ class VectorQuantizerEMA(nn.Module):
         loss_commit = self.beta * F.mse_loss(x, z_q.detach())
 
         # 6. Ентропійна регуляризація з Лапласовим згладжуванням (Laplace Smoothing)
-        logits_ent = -dist / self.temperature
+        # Розрахунок ведеться строго в FP32 для усунення піднормального занулення в FP16 / BF16
+        logits_ent = -dist.float() / max(self.temperature, 1e-4)
         probs_ent = F.softmax(logits_ent, dim=-1)   # [N, Kc]
         p_mean = probs_ent.mean(dim=0)              # [Kc]
 
         # Рівняння Лапласового згладжування (специфікація 01, формула 281):
         # p_{j, eps} = (1 - eps) * p_j + (eps / Kc)
+        # Обмеження clamp(min=1e-12) гарантує відсутність log(0) = -inf та 0 * -inf = NaN у будь-яких precision режимах
         p_smooth = (1.0 - self.laplace_eps) * p_mean + (self.laplace_eps / self.codebook_size)
+        p_smooth = torch.clamp(p_smooth, min=1e-12)
         entropy = -torch.sum(p_smooth * torch.log(p_smooth))
-        loss_entropy = -self.entropy_lambda * entropy
+        loss_entropy = -self.entropy_lambda * entropy.to(x.dtype)
 
         total_loss = loss_commit + loss_entropy
 
@@ -392,8 +405,8 @@ class VectorQuantizerEMA(nn.Module):
                     / (n_total + self.codebook_size * self.laplace_eps)
                 ) * n_total
 
-                # Нормалізований розрахунок оновлених центроїдів
-                updated_embedding = self.ema_w / cluster_size_smooth.unsqueeze(-1)
+                # Нормалізований розрахунок оновлених центроїдів із захистом знаменника
+                updated_embedding = self.ema_w / cluster_size_smooth.clamp(min=1e-5).unsqueeze(-1)
                 if self.spherical:
                     updated_embedding = F.normalize(updated_embedding, p=2, dim=-1)
 
@@ -555,12 +568,13 @@ class MultiScaleResidualVectorQuantizer(nn.Module):
                 SemanticScale.L0_GLOBAL_DISCOURSE,
                 SemanticScale.L1_SYNTAX,
                 SemanticScale.L2_SURFACE_TOKENS,
+                SemanticScale.L3_SUB_SCALE,
             ]
-            if num_levels <= 3:
+            if num_levels <= len(canonical_scales):
                 self.scales = canonical_scales[:num_levels]
             else:
                 self.scales = canonical_scales + [
-                    SemanticScale(f"L{i}_SUB_SCALE") for i in range(3, num_levels)
+                    SemanticScale.L3_SUB_SCALE for _ in range(len(canonical_scales), num_levels)
                 ]
 
         # Ініціалізація рівнів квантувальника
@@ -612,6 +626,19 @@ class MultiScaleResidualVectorQuantizer(nn.Module):
         for m, quantizer in enumerate(self.quantizers):
             # Квантування поточного залишку
             z_ste_m, indices_m, level_out = quantizer(residual)
+
+            # Захист монотонного стискання Теореми 2.1 від шуму та малих залишкових амплітуд:
+            # Якщо віднімання центроїда збільшує похибку (||r - z|| > ||r||), застосовується
+            # оптимальна проекція alpha = clamp(<r, z> / ||z||^2, 0, 1), що математично
+            # гарантує монотонне незростання похибки квантування: ||r_m|| <= ||r_{m-1}||.
+            step_err = (residual - z_ste_m).norm(dim=-1, keepdim=True)
+            res_norm = residual.norm(dim=-1, keepdim=True)
+            expand_mask = (step_err > res_norm) & (res_norm > 1e-8)
+            if expand_mask.any():
+                dots = (residual * z_ste_m).sum(dim=-1, keepdim=True)
+                z_sq = z_ste_m.pow(2).sum(dim=-1, keepdim=True).clamp(min=1e-8)
+                alpha = torch.clamp(dots / z_sq, min=0.0, max=1.0)
+                z_ste_m = torch.where(expand_mask, alpha * z_ste_m, z_ste_m)
 
             # Накопичення реконструкції
             quantized_accum = quantized_accum + z_ste_m

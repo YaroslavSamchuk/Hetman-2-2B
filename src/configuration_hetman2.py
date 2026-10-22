@@ -694,20 +694,24 @@ class Hetman2Config(PretrainedConfig):
         tensor_data_offset: int = 0,
         bpe_vocab_offset: int = 0,
         bpe_vocab_size_bytes: int = 0,
+        header_crc32: int = 0,
+        table_crc32: int = 0,
+        flags: int = 1,
     ) -> bytes:
         """
         Packs the configuration into an exact 128-byte binary header conforming
-        to `RadaNcmFileHeader` defined in `spec/rada_ncm_engine.hpp`.
+        to `RadaNcmFileHeader` defined in `spec/rada_ncm_engine.hpp` and `src/export_to_rada.py`.
 
         Struct Layout:
-          18 x uint32_t (72 bytes)
-           4 x uint64_t (32 bytes)
-          24 x uint8_t  (24 bytes padding)
-          Total: exactly 128 bytes.
+          18 x uint32_t (72 bytes: architectural parameters)
+           4 x uint64_t (32 bytes: section offsets and sizes)
+           3 x uint32_t (12 bytes: header_crc32, table_crc32, flags)
+          12 x uint8_t  (12 bytes: padding to 128 bytes)
+          Total: exactly 128 bytes (strictly alignas(64)).
         """
         self.validate()
         header_bytes = struct.pack(
-            "<18I4Q24s",
+            "<18I4Q3I12s",
             int(self.rada_magic),
             int(self.rada_version),
             int(self.vocab_size),
@@ -730,7 +734,10 @@ class Hetman2Config(PretrainedConfig):
             int(tensor_data_offset),
             int(bpe_vocab_offset),
             int(bpe_vocab_size_bytes),
-            b"\x00" * 24,
+            int(header_crc32),
+            int(table_crc32),
+            int(flags),
+            b"\x00" * 12,
         )
         assert len(header_bytes) == 128, f"Rada header must be 128 bytes, got {len(header_bytes)}"
         return header_bytes

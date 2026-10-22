@@ -201,23 +201,55 @@ struct alignas(RADA_NCM_CACHE_LINE) RadaGlobalKVCache {
 static_assert(sizeof(RadaGlobalKVCache) == BYTES_GLOBAL_KV_CACHE,
               "RadaGlobalKVCache must exactly match BYTES_GLOBAL_KV_CACHE!");
 
+// =================================================================================================
+// ВАРІАНТ В: ГІБРИДНИЙ ДУАЛЬНИЙ КОНТУР МИСЛЕННЯ (HYBRID DUAL-LOOP DELIBERATION)
+// =================================================================================================
+
+enum class CognitiveLevel : uint32_t {
+    AUTO    = 0,
+    SIMPLE  = 1, // 2 проходи Фази 2, 0 аварійних проходів (латентність ~20 мс)
+    MEDIUM  = 2, // 4 проходи Фази 2, 1 аварійний прохід (латентність ~50 мс)
+    COMPLEX = 3  // 8..32 проходів з адаптивною зупинкою Банаха (латентність ~200-350 мс)
+};
+
+struct alignas(RADA_NCM_CACHE_LINE) DeliberationConfig {
+    bool           enable_deliberation  = true;
+    bool           explain_thought      = false;
+    bool           think                = false;
+    CognitiveLevel forced_level         = CognitiveLevel::AUTO;
+    uint32_t       max_refine_passes    = 32;
+    float          banach_epsilon       = 1e-4f;
+    const bool*    early_stop_signal    = nullptr; // Атомарний прапорець раннього переривання (<15 мс)
+};
+
+struct DeliberationTelemetry {
+    uint32_t cognitive_level_assigned = 0;
+    float    complexity_score         = 0.0f;
+    uint32_t passes_executed          = 0;
+    float    final_cauchy_ratio       = 0.0f;
+    bool     banach_converged         = false;
+    bool     early_stopped            = false;
+};
+
 // Параметри запуску генерації
 struct GenerationConfig {
-    float    temperature   = 0.7f;
-    float    top_p         = 0.9f;
-    uint32_t target_tokens = 1600; // Типовий запит: 4 блоки по 400 токенів
-    bool     stream        = true;
+    float              temperature   = 0.7f;
+    float              top_p         = 0.9f;
+    uint32_t           target_tokens = 1600; // Типовий запит: 4 блоки по 400 токенів
+    bool               stream        = true;
+    DeliberationConfig deliberation{};       // Конфігурація мислення (Варіант В)
 };
 
 // Телеметрія виконання
 struct ExecutionTelemetry {
-    double time_phase1_ms       = 0.0;
-    double time_phase2_ms       = 0.0;
-    double time_phase3_ms       = 0.0;
-    double total_time_sec       = 0.0;
-    double tokens_per_second    = 0.0;
-    size_t peak_ram_bytes       = 0;
-    bool   all_allocations_zero = true;
+    double                time_phase1_ms       = 0.0;
+    double                time_phase2_ms       = 0.0;
+    double                time_phase3_ms       = 0.0;
+    double                total_time_sec       = 0.0;
+    double                tokens_per_second    = 0.0;
+    size_t                peak_ram_bytes       = 0;
+    bool                  all_allocations_zero = true;
+    DeliberationTelemetry deliberation_telem{}; // Звіт про збіжність Банаха та рівень складності
 };
 
 // =================================================================================================

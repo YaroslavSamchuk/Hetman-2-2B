@@ -88,6 +88,8 @@ class Hetman2Config(PretrainedConfig):
         "hopfield_num_groups": ["hopfield_groups"],
         "refiner_iterations": ["refine_passes"],
         "refiner_dedup_threshold": ["dedup_tau"],
+        "enable_dual_loop_deliberation": ["enable_deliberation", "use_deliberation"],
+        "deliberation_max_passes": ["max_deliberation_passes"],
     }
 
     # Reverse alias lookup: alias -> canonical attribute name
@@ -204,6 +206,12 @@ class Hetman2Config(PretrainedConfig):
         refiner_iterations: int = 4,
         refiner_dedup_threshold: float = 0.85,
         refiner_lipschitz_bound: float = 0.957,
+        # Dual-Loop Deliberation (Variant C)
+        enable_dual_loop_deliberation: bool = True,
+        deliberation_max_passes: int = 32,
+        deliberation_banach_tol: float = 1e-4,
+        explain_thought_default: bool = False,
+        think_tag_default: bool = False,
         # Phase 3: Block-Causal NCM Decoder & Dynamic Intent Evolution
         overlap_size: int = 16,
         max_blocks: int = 8,
@@ -374,6 +382,12 @@ class Hetman2Config(PretrainedConfig):
         self.refiner_iterations = resolved_refiner_iterations
         self.refiner_dedup_threshold = resolved_refiner_dedup_threshold
         self.refiner_lipschitz_bound = float(refiner_lipschitz_bound)
+        # Dual-Loop Deliberation (Variant C)
+        self.enable_dual_loop_deliberation = bool(enable_dual_loop_deliberation)
+        self.deliberation_max_passes = int(deliberation_max_passes)
+        self.deliberation_banach_tol = float(deliberation_banach_tol)
+        self.explain_thought_default = bool(explain_thought_default)
+        self.think_tag_default = bool(think_tag_default)
 
         # Phase 3: Block Decoder & Dynamic Blueprint Evolution
         self.overlap_size = resolved_overlap_size

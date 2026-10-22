@@ -331,6 +331,7 @@ class ThoughtVerbalizerHead(nn.Module):
             "action": action_name,
             "confidence": round(confidence, 4),
             "residual_norm": round(residual_norm, 5),
+            "delta_norm": round(residual_norm, 5),
             "summary": f"Iteration {pass_idx:02d}: [{action_name}] (delta_norm={residual_norm:.5f}, conf={confidence:.2f})"
         }
 

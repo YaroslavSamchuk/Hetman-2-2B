@@ -64,6 +64,13 @@ from src.hopfield_kv_cache import (
     HopfieldKVCache,
     AttractorAugmentedAttention,
 )
+from src.dual_loop_deliberation import (
+    CognitiveDifficultyRouter,
+    ThoughtVerbalizerHead,
+    CognitiveLevel,
+    DeliberationProfile,
+    PROFILES,
+)
 
 # ==============================================================================
 # 0. OPERATING MODE CONSTANTS (100% PARAMETER REUSE)
@@ -1056,6 +1063,9 @@ class Hetman2Model(Hetman2PreTrainedModel):
         self.seam_smoother = BoundarySeamSmoother(d_model=config.hidden_size, window_size=config.seam_window)
         self.watchdog = DirichletEnergyWatchdog()
         self.fwht_quantizer = FastWalshHadamardTransform(block_size=config.hadamard_block_size)
+        # Dual-Loop Deliberation Components (Variant C)
+        self.cdr_router = CognitiveDifficultyRouter(d_model=config.hidden_size)
+        self.thought_verbalizer = ThoughtVerbalizerHead(d_model=config.hidden_size)
 
         # Phase 1 & 3 Components
         self.blueprint_heads = BlueprintPredictionHeads(config)
@@ -1211,11 +1221,21 @@ class Hetman2Model(Hetman2PreTrainedModel):
         }
         return x_out, hopfield_loss, new_states
 
-    def refine_blueprints(self, H_raw: torch.Tensor, num_passes: int = 4) -> Dict[str, Any]:
+    def refine_blueprints(
+        self,
+        H_raw: torch.Tensor,
+        num_passes: int = 4,
+        banach_tol: float = 1e-4,
+        adaptive: bool = True,
+        explain_thought: bool = False,
+        think: bool = False,
+        early_stop_callback: Optional[Any] = None,
+    ) -> Dict[str, Any]:
         """
-        Phase 2: Global Bidirectional NCM Refiner.
+        Phase 2: Global Bidirectional NCM Refiner (Variant C Hybrid Deliberation).
         Reuses the exact 16-layer Verified Logic Arbiter in MODE_REFINE.
-        Applies Semantic Deduplication, Boundary Seam Smoothing, Dirichlet Watchdog, and FWHT Normalization.
+        Applies Semantic Deduplication, Boundary Seam Smoothing, Dirichlet Watchdog,
+        FWHT Normalization, and Adaptive Banach Fixed-Point Convergence.
         H_raw: [B, K, L_c, d]
         """
         B, K, L_c, d = H_raw.shape
@@ -1229,8 +1249,21 @@ class Hetman2Model(Hetman2PreTrainedModel):
         }
 
         alpha_anchor = self.config.alpha_residual_anchor
+        trajectory = [H_0.clone()]
+        thought_steps = []
+        converged = False
+        exit_pass = num_passes
 
         for step in range(1, num_passes + 1):
+            # Check user early stop request (< 15 ms abort-to-stream)
+            if early_stop_callback is not None:
+                abort = early_stop_callback() if callable(early_stop_callback) else bool(getattr(early_stop_callback, "is_set", lambda: False)())
+                if abort and step >= 2:
+                    exit_pass = step
+                    break
+
+            H_prev = H_curr.clone()
+
             # 1. Inject MODE_REFINE embedding
             H_conditioned = H_curr + self.mode_embeddings[MODE_REFINE]
 
@@ -1260,8 +1293,23 @@ class Hetman2Model(Hetman2PreTrainedModel):
             rms = torch.sqrt(torch.mean(H_quant ** 2, dim=-1, keepdim=True) + 1e-5)
             H_curr = H_quant / rms
 
+            # Banach Contraction Cauchy Check
+            delta_step = H_curr - H_prev
+            step_disp = float(torch.norm(delta_step, p=2, dim=-1).mean().item())
+            base_norm = float(torch.norm(H_0, p=2, dim=-1).mean().clamp(min=1e-5).item())
+            cauchy_ratio = step_disp / base_norm
+
+            trajectory.append(H_curr.clone())
+
+            if explain_thought and hasattr(self, "thought_verbalizer"):
+                step_desc = self.thought_verbalizer.verbalize_trajectory_step(
+                    delta_step, pass_idx=step, residual_norm=cauchy_ratio
+                )
+                thought_steps.append(step_desc)
+
             telemetry["pass_telemetry"].append({
                 "pass": step,
+                "cauchy_ratio": cauchy_ratio,
                 "repulsion_events": repulsions,
                 "dirichlet_energy": current_energy,
                 "watchdog_triggered": watchdog_triggered,
@@ -1269,9 +1317,28 @@ class Hetman2Model(Hetman2PreTrainedModel):
                 "mean_rms": rms.mean().item()
             })
 
+            # Early Banach convergence: stop if Cauchy ratio is below tolerance
+            if adaptive and step >= 2 and cauchy_ratio < banach_tol:
+                converged = True
+                exit_pass = step
+                break
+
         H_final = self.final_norm(H_curr)
         telemetry["final_dirichlet_energy"] = self.watchdog.compute_energy(H_final).item()
-        return {"refined_blueprints": H_final, "telemetry": telemetry}
+        telemetry["total_passes_executed"] = exit_pass
+        telemetry["banach_converged"] = converged
+        telemetry["final_cauchy_ratio"] = telemetry["pass_telemetry"][-1]["cauchy_ratio"] if telemetry["pass_telemetry"] else 0.0
+
+        think_blueprint = None
+        if think and hasattr(self, "thought_verbalizer"):
+            think_blueprint = self.thought_verbalizer.synthesize_think_blueprint(trajectory)
+
+        return {
+            "refined_blueprints": H_final,
+            "think_blueprint": think_blueprint,
+            "thought_steps": thought_steps,
+            "telemetry": telemetry
+        }
 
 
 # ==============================================================================
@@ -1383,14 +1450,19 @@ class Hetman2ForCausalLM(Hetman2PreTrainedModel):
         max_tokens: int = 1600,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        repetition_penalty: float = 1.15
+        repetition_penalty: float = 1.15,
+        deliberate: bool = True,
+        explain_thought: bool = False,
+        think: bool = False,
+        cognitive_level: Optional[str] = None,
+        early_stop_requested: Optional[Any] = None,
     ) -> Dict[str, Any]:
         """
-        Complete 3-Phase Block-Causal NCM Generative Pipeline:
+        Complete 3-Phase Block-Causal NCM Generative Pipeline with Hybrid Dual-Loop Deliberation (Variant C):
         - Phase 1: Causal AR Blueprint Drafter (MODE_DRAFT) generates K blueprints [B_1, ..., B_K]
-        - Phase 2: Global Bidirectional NCM Refiner (MODE_REFINE) with Deduplication & Seam Smoothing
+        - Phase 2: Dual-Loop Latent Banach Deliberation (MODE_REFINE) with CDR routing & early stop
         - Phase 3: Block-Causal NCM Decoder (MODE_DECODE) via 3-4 parallel RVQ passes per 400-token block
-        Returns clean synthesized tokens (up to max_tokens) and execution telemetry.
+        Returns clean synthesized tokens (up to max_tokens), cognitive profile, and thought telemetry.
         """
         device = next(self.parameters()).device
         if isinstance(prompt, str):
@@ -1459,14 +1531,36 @@ class Hetman2ForCausalLM(Hetman2PreTrainedModel):
         H_raw_blueprints = torch.cat(raw_blueprints_list, dim=1)
 
         # -------------------------------------------------------------
-        # 3. PHASE 2: GLOBAL BIDIRECTIONAL NCM REFINER (MODE_REFINE)
+        # 3. PHASE 2: GLOBAL BIDIRECTIONAL NCM REFINER / DUAL-LOOP DELIBERATION (MODE_REFINE)
         # -------------------------------------------------------------
-        # 4 recurrent passes through the 16-layer Verified Logic Arbiter
+        forced_lvl = None
+        if cognitive_level is not None:
+            lvl_map = {"simple": CognitiveLevel.SIMPLE, "medium": CognitiveLevel.MEDIUM, "complex": CognitiveLevel.COMPLEX}
+            forced_lvl = lvl_map.get(cognitive_level.lower())
+
+        if deliberate and hasattr(self.model, "cdr_router"):
+            route_info = self.model.cdr_router(h_last_prompt, force_level=forced_lvl)
+            chosen_profile = route_info["profile"]
+            num_refine_passes = chosen_profile.phase2_passes
+            banach_tol = chosen_profile.banach_tol
+        else:
+            route_info = None
+            chosen_profile = None
+            num_refine_passes = getattr(self.config, "refine_passes", 4)
+            banach_tol = 1e-4
+
         refinement_result = self.model.refine_blueprints(
             H_raw_blueprints,
-            num_passes=self.config.refine_passes
+            num_passes=num_refine_passes,
+            banach_tol=banach_tol,
+            adaptive=True,
+            explain_thought=explain_thought,
+            think=think,
+            early_stop_callback=early_stop_requested,
         )
         refined_blueprints = refinement_result["refined_blueprints"]  # [B, K, 16, d]
+        think_blueprint = refinement_result.get("think_blueprint")
+        thought_steps = refinement_result.get("thought_steps", [])
         telemetry_phase2 = refinement_result["telemetry"]
 
         # -------------------------------------------------------------
@@ -1544,12 +1638,26 @@ class Hetman2ForCausalLM(Hetman2PreTrainedModel):
 
         all_generated_tokens = torch.cat(generated_token_blocks, dim=-1)[:, :max_tokens]
 
+        cognitive_report = None
+        if route_info is not None:
+            cognitive_report = {
+                "level": route_info["level"].name,
+                "complexity_score": float(route_info["complexity_score"].item()),
+                "passes_budget": num_refine_passes,
+                "passes_executed": telemetry_phase2.get("total_passes_executed", num_refine_passes),
+                "banach_converged": telemetry_phase2.get("banach_converged", False),
+                "final_cauchy_ratio": telemetry_phase2.get("final_cauchy_ratio", 0.0),
+            }
+
         return {
             "generated_tokens": all_generated_tokens,
             "num_blocks_generated": actual_num_blocks,
             "total_tokens": all_generated_tokens.shape[-1],
             "blueprints": blueprints_obj_list,
-            "refinement_telemetry": telemetry_phase2
+            "refinement_telemetry": telemetry_phase2,
+            "thought_steps": thought_steps,
+            "think_blueprint": think_blueprint,
+            "cognitive_profile": cognitive_report,
         }
 
 
@@ -1661,6 +1769,27 @@ def run_end_to_end_verification():
     assert gen_tokens.shape[-1] <= 128
     assert not torch.isnan(gen_tokens.float()).any()
     print(">>> TEST 4 PASSED: Complete 3-Phase NCM generative pipeline fully verified.")
+
+    print("\n--- TEST 5: Variant C Hybrid Dual-Loop Deliberation (generate_ncm deliberate=True) ---")
+    gen_delib = model.generate_ncm(
+        prompt=prompt,
+        max_tokens=64,
+        deliberate=True,
+        explain_thought=True,
+        think=True,
+        cognitive_level="complex"
+    )
+    print(f"Cognitive Profile: {gen_delib['cognitive_profile']}")
+    print(f"Deliberation Passes Executed: {gen_delib['cognitive_profile']['passes_executed']}")
+    print(f"Banach Converged: {gen_delib['cognitive_profile']['banach_converged']}")
+    print(f"Verbalized Thought Steps Emitted: {len(gen_delib['thought_steps'])}")
+    for s in gen_delib['thought_steps'][:3]:
+        print(f"  * {s['summary']}")
+    assert gen_delib["cognitive_profile"]["level"] == "COMPLEX"
+    assert len(gen_delib["thought_steps"]) >= 2
+    assert gen_delib["think_blueprint"] is not None
+    assert gen_delib["generated_tokens"].shape[-1] <= 64
+    print(">>> TEST 5 PASSED: Variant C Hybrid Dual-Loop Deliberation fully integrated into generate_ncm.")
 
     print("\n" + "=" * 80)
     print("ALL VERIFICATION SUITE TESTS PASSED WITH 100% SUCCESS!")

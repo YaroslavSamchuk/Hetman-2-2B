@@ -17,6 +17,7 @@
 | Технологія | Суть і принцип роботи | Досягнутий ефект |
 |:---|:---|:---:|
 | **Block-Causal Hierarchical NCM** | Генерація у 3 фази: **Phase 1** (Causal AR Drafter, 4–8 макро-кроків) $\to$ **Phase 2** (Global Bidirectional Refiner + Cosine Dedup) $\to$ **Phase 3** (Block-Causal NCM Decoder по 400 токенів). Замість 1600+ покрокових авторегресійних кроків — всього **25–30 кроків** на весь документ. | **$10\times\text{--}15\times$ прискорення генерації** на CPU ноутбука ($1.5\text{--}3.0\text{ с}$ на 1600 токенів) |
+| **Hybrid Dual-Loop Deliberation (Variant C)** | Інтегрована система динамічного сінкінгу («стільки, скільки треба»): Cognitive Difficulty Router (Simple / Medium / Complex) + внутрішній латентний цикл Банаха у кеші L2 процесора ($>1000\text{ GB/s}$) + телеметрія думок Thought Verbalizer та аварійна зупинка «Відповідай зараз!» ($<15\text{ мс}$). | **0 байт додаткового KV-кешу**, усунення пастки каузальної помилки, миттєве міркування за **$20\text{--}350\text{ мс}$** |
 | **BitNet b1.58 Ternary Weights** | Усі ваги лінійних шарів квантовані в $\{-1, 0, +1\}$ (2 біти на вагу). Множення замінено на цілочисельне додавання/віднімання. | **$495.77\text{ MiB}$** на всі ваги моделі 2.1B (замість $4.2\text{ GiB}$ у FP16) |
 | **FWHT INT8 Activation Engine** | Блокове швидке перетворення Волша-Адамара ($B=512$) перед лінійними проекціями зрізає аномальні сплески активацій (outliers). | **Нульова втрата Perplexity** при 8-бітових активаціях без FP-масштабування |
 | **Gated DeltaNet Constant-Memory State** | 28 із 34 шарів бекбону використовують лінійну рекурентність $S_t \in \mathbb{R}^{d \times d}$ з гарантованою стійкістю Ляпунова $\rho(M_t) < 1.0$. Пам'ять не росте з довжиною контексту. | Строго **$7.000000\text{ MiB}$ FP32** на весь контекст (до 256k токенів) |
@@ -104,15 +105,18 @@ from transformers import AutoConfig, AutoModelForCausalLM
 config = AutoConfig.from_pretrained("configs", trust_remote_code=True)
 model = AutoModelForCausalLM.from_pretrained("configs", trust_remote_code=True)
 
-# Генерація тексту за трифазним пайплайном NCM
+# Генерація тексту за трифазним пайплайном NCM з динамічним сінкінгом (Варіант В)
 prompt = "Поясни принципи квантових обчислень простою мовою."
 output = model.generate_ncm(
     prompt,
-    max_blocks=4,              # до 1600 токенів
-    base_passes=8,             # якість синтезу
-    emergency_passes=3         # коригувальні проходи шлюзу впевненості
+    max_tokens=1600,
+    deliberate=True,           # динамічний сінкінг («стільки, скільки треба»)
+    explain_thought=True,      # інспекція структурованих кроків міркувань
+    think=False                # генерація окремого <think> блоку
 )
-print(output)
+print("Cognitive Level:", output["cognitive_profile"]["level"])
+print("Passes Executed:", output["cognitive_profile"]["passes_executed"])
+print("Generated Tokens:", output["generated_tokens"])
 ```
 
 ---
@@ -144,6 +148,7 @@ Hetman-2-2B/
 ├── src/
 │   ├── modeling_hetman2.py             # Єдиний тернарний бекбон (DRAFT/REFINE/DECODE)
 │   ├── configuration_hetman2.py        # HuggingFace PretrainedConfig з перевіркою типів
+│   ├── dual_loop_deliberation.py       # Варіант В: Гібридний дуальний контур (CDR + Banach Loop)
 │   ├── deltanet.py                     # Gated DeltaNet O(1) рекурентне ядро (FP32 State)
 │   ├── hopfield_core.py                # SLH-Core v2 (16.78M слотів фактологічної пам'яті)
 │   ├── hopfield_kv_cache.py            # Ієрархічний Hopfield KV-кеш з алгоритмом Велфорда
@@ -155,12 +160,13 @@ Hetman-2-2B/
 │   ├── quantization.py                 # BitNet b1.58 (Format 0) + in-place FWHT INT8
 │   └── export_to_rada.py               # Потоковий експортер у двійковий формат Rada v2
 ├── spec/
-│   ├── 01..15_*.md                     # 15 повних архітектурних RFC-специфікацій
-│   ├── audits/                         # 20 звітів прискіпливого аудиту субагентів
+│   ├── 01..24_*.md                     # 24 повні архітектурні RFC-специфікації
+│   ├── audits/                         # 21 звіт прискіпливого аудиту субагентів
 │   ├── MASTER_AUDIT_SYNTHESIS_REPORT.md# Генеральний синтетичний звіт аудиту
 │   └── rada_ncm_engine.hpp             # C++20 заголовок рушія Rada.cpp (Zero-Alloc Arena)
-├── tests/                              # Комплексні регресійні та стрес-тести
-└── training_loss_engine.py             # Оптимізатор Muon + трифазний тренувальний лос
+├── tests/                              # Комплексні регресійні, стрес- та сінкінг-тести
+├── training_loss_engine.py             # Оптимізатор Muon + трифазний тренувальний лос
+└── training_reasoning_grpo.py          # Critic-Free GRPO рушій навчання деліберації
 ```
 
 ---

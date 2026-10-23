@@ -186,7 +186,7 @@ class Hetman2Config(PretrainedConfig):
         hopfield_topk_1: int = 8,
         hopfield_topk_2: int = 4,
         hopfield_shared_attractors: int = 1,
-        hopfield_beta: float = 0.176776695,  # 1.0 / sqrt(32)
+        hopfield_beta: float = 8.0,  # Modern Continuous Hopfield inverse temperature (Ramsauer et al., 2020)
         hopfield_pid_ki: float = 0.01,
         hopfield_pid_kd: float = 0.005,
         # Phase 1: Causal AR Blueprint Drafter

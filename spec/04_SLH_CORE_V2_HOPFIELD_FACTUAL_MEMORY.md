@@ -487,7 +487,7 @@ class SLHCoreNCMAdapter(nn.Module):
         expanded_dim: int = 128,
         topk_1: int = 8,
         topk_2: int = 4,
-        beta: float = 0.1767767,  # 1 / sqrt(32)
+        beta: float = 8.0,  # Modern Continuous Hopfield inverse temperature (Ramsauer et al., 2020)
         pid_ki: float = 0.01,
         pid_kd: float = 0.005,
         pack_2bit: bool = False

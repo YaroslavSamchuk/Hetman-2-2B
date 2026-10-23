@@ -62,7 +62,7 @@
   "hopfield_topk_1": 8,
   "hopfield_topk_2": 4,
   "hopfield_shared_attractors": 1,
-  "hopfield_beta": 0.176776695,
+  "hopfield_beta": 8.0,
   "hopfield_pid_ki": 0.01,
   "hopfield_pid_kd": 0.005,
   "d_drafter": 512,

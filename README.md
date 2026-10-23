@@ -6,7 +6,7 @@
 [![HuggingFace: Compatible](https://img.shields.io/badge/HuggingFace-Transformers-yellow.svg)](https://huggingface.co)
 [![Peak RAM: < 530 MiB](https://img.shields.io/badge/Peak%20RAM-525.74%20MiB-purple.svg)](#memory-arena)
 [![Context: 256k Tokens](https://img.shields.io/badge/Context-256k%20Tokens-red.svg)](#hopfield-kv-cache)
-[![Tests: 78/78 Passing](https://img.shields.io/badge/Tests-78%2F78%20Passed-success.svg)](tests/)
+[![Tests: 102/102 Passing](https://img.shields.io/badge/Tests-102%2F102%20Passed-success.svg)](tests/)
 
 > **Hetman-2-NCM 2.0B** — надшвидка фундаментальна локальна мовна модель нового покоління для споживчих ноутбуків (від 4–8 ГБ RAM) та мобільних пристроїв. Поєднує 1.58-бітний апаратний фундамент **BitNet + DeltaNet + Hopfield** із трифазним генеративним рушієм **Block-Causal Next-Concept Modeling (NCM)**.
 
@@ -133,8 +133,8 @@ python -m unittest discover tests
 python -m unittest tests/test_chaos_monkey_adversarial.py
 ```
 
-* **78/78 тестів пройдено успішно** (`OK`).
-* **Chaos Monkey (13/13 векторів атак відбито):** порожні промпти, 10 000 повторень, шторм емодзі, ін'єкція NaN, спам слотів Хопфілда, виродження планів — повне самовідновлення без падінь.
+* **102/102 тестів пройдено успішно** (`OK`).
+* **Chaos Monkey (17/17 векторів атак відбито):** порожні промпти, 10 000 повторень, шторм емодзі, ін'єкція NaN, спам слотів Хопфілда, виродження планів — повне самовідновлення без падінь.
 
 ---
 

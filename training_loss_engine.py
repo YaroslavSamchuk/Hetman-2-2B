@@ -418,7 +418,18 @@ def create_hybrid_optimizers(
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if p.ndim == 2 and "embed" not in name.lower() and "codebook" not in name.lower():
+        name_lower = name.lower()
+        is_muon_eligible = (
+            p.ndim == 2
+            and "embed" not in name_lower
+            and "codebook" not in name_lower
+            and "hopfield" not in name_lower
+            and "v_shared" not in name_lower
+            and "anchor" not in name_lower
+            and "pattern" not in name_lower
+            and "prototype" not in name_lower
+        )
+        if is_muon_eligible:
             muon_params.append(p)
         else:
             adamw_params.append(p)

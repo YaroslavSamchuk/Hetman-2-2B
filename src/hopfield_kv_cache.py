@@ -464,9 +464,10 @@ class HopfieldKVCache:
         diff = k_fp32 - mu_k_list[best_att_idx]
         dist_sq = torch.sum(diff ** 2).item()
 
-        # Numerically safe dispersion (strictly non-negative floor against ZeroDivisionError & FP32 negative dispersion)
-        disp = max(float(self.attractors[best_att_idx].dispersion[0, 0].item()), 1e-4)
-        mahalanobis = dist_sq / disp
+        # Numerically safe dispersion with quantization noise floor (protects against repetitive token anomaly flood)
+        disp_val = max(float(self.attractors[best_att_idx].dispersion[0, 0].item()), 0.0)
+        effective_disp = max(disp_val, QUANT_NOISE_FLOOR) + EPS_DISPERSION_FLOOR
+        mahalanobis = dist_sq / effective_disp
 
         # If token belongs to the nearest attractor's semantic topic:
         if best_sim.item() >= self.merge_sim_cos:

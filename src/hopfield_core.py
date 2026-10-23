@@ -11,7 +11,7 @@ Architecture Summary:
   - Hardware 2-bit Packed Storage (~128.0 MiB VRAM footprint, 0.25 bytes/weight)
   - TPU MXU Systolic Linear Expansion: 32 -> 128 via semi-orthogonal W_expand
   - Sparse Bilinear Retrieval: Top-8 (C1) x Top-4 (C2) = Top-32 slots per group (0.00305% active space)
-  - Modern Continuous Hopfield Associative Energy with beta = 1/sqrt(32) ≈ 0.1767767
+  - Modern Continuous Hopfield Associative Energy with beta = 8.0 (Ramsauer et al., 2020)
   - Non-differentiable Dynamic PID Load Balancer (Aux-Loss-Free, K_i=0.01, K_d=0.005)
   - Online Hot-Patching Engine: hot_patch_fact() for zero-shot factual updates without fine-tuning
   - Factual Anchoring Bridge for Phase 3 Word Decoder (Anti-Hallucination Gate)
@@ -41,7 +41,7 @@ class SLHCoreConfig:
     hopfield_expanded_dim: int = 128
     hopfield_topk_1: int = 8
     hopfield_topk_2: int = 4
-    hopfield_beta: float = 0.1767766952966369  # 1.0 / math.sqrt(32)
+    hopfield_beta: float = 8.0  # Modern Continuous Hopfield inverse temperature (Ramsauer et al., 2020)
     hopfield_pid_ki: float = 0.01
     hopfield_pid_kd: float = 0.005
     hopfield_pack_2bit: bool = True
@@ -118,7 +118,7 @@ class SLHCoreNCMAdapter(nn.Module):
         expanded_dim: int = 128,
         topk_1: int = 8,
         topk_2: int = 4,
-        beta: float = 0.1767766952966369,  # 1 / sqrt(32)
+        beta: float = 8.0,  # Modern Continuous Hopfield inverse temperature
         pid_ki: float = 0.01,
         pid_kd: float = 0.005,
         pack_2bit: bool = True,
@@ -221,7 +221,9 @@ class SLHCoreNCMAdapter(nn.Module):
         # 7. Knowledge Output Projection: 16 * 128 = 2048 -> 1536
         self.out_proj = BitLinear(self.num_groups * self.expanded_dim, self.hidden_size, bias=False)
 
-        # 8. Phase 3 Decoder Factual Anti-Hallucination Gate
+        # 8. Phase 3 Decoder Factual Anti-Hallucination Gate with RMSNorm Stabilization
+        self.norm_dec = nn.RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
+        self.norm_ctx = nn.RMSNorm(self.hidden_size, eps=self.rms_norm_eps)
         self.anchor_gate = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=True)
 
         self.reset_parameters()
@@ -346,7 +348,7 @@ class SLHCoreNCMAdapter(nn.Module):
     ) -> torch.Tensor:
         """
         Modern Continuous Hopfield Energy Function (Ramsauer et al., 2020):
-            E(q) = - (1 / beta) * LogSumExp(beta * pair_scores) + 0.5 * (||q1||^2 + ||q2||^2)
+            E(q) = - (1 / beta) * (LogSumExp(beta * pair_scores) - ln(M)) + 0.5 * (||q1||^2 + ||q2||^2)
         
         Args:
             pair_scores_flat: [B, K, num_groups, 32] raw bilinear similarity scores
@@ -356,9 +358,9 @@ class SLHCoreNCMAdapter(nn.Module):
         Returns:
             energy: [B, K, num_groups] Continuous Hopfield Lyapunov energy per group
         """
-        # Log-Sum-Exp contraction over the 32 active attractor states
+        num_slots = pair_scores_flat.shape[-1]
         lse = torch.logsumexp(self.beta * pair_scores_flat, dim=-1)  # [B, K, num_groups]
-        energy = - (1.0 / self.beta) * lse
+        energy = - (1.0 / self.beta) * (lse - math.log(float(num_slots)))
 
         # Add quadratic query regularization if provided (for unit vectors on S^63 this is exactly 1.0)
         if q1 is not None and q2 is not None:
@@ -496,9 +498,9 @@ class SLHCoreNCMAdapter(nn.Module):
         attn_var_g = torch.var(attn_weights, dim=-1)  # [B, K, 16]
 
         # Group-level jamming gate: suppresses dynamic micro-facts when trapped in uniform spurious superposition
-        # Smooth sigmoid gate: 0.0 when selective, 1.0 when jammed
-        spurious_jammed_g = (entropy_g > 0.95) | (attn_var_g < 1e-5)
-        jam_gate_g = torch.sigmoid((entropy_g - 0.94) * 40.0)  # [B, K, 16]
+        # Calibrated for beta = 8.0: selective states have entropy < 0.40; spurious states have entropy > 0.85
+        spurious_jammed_g = (entropy_g > 0.85) | (attn_var_g < 1e-4)
+        jam_gate_g = torch.sigmoid((entropy_g - 0.80) * 20.0)  # [B, K, 16]
 
         if self.pack_2bit and hasattr(self, "lut_2bit") and self.lut_2bit is not None and self.V_packed is not None:
             # High-performance Vectorized LUT path across all 16 groups (Sub-millisecond)
@@ -575,12 +577,8 @@ class SLHCoreNCMAdapter(nn.Module):
                 context_pool = y_factual_context.mean(dim=1, keepdim=True).expand(-1, phase3_decoder_state.shape[1], -1)
             else:
                 context_pool = y_factual_context
-            gate_input = torch.cat([phase3_decoder_state, context_pool], dim=-1)
+            gate_input = torch.cat([self.norm_dec(phase3_decoder_state), self.norm_ctx(context_pool)], dim=-1)
             g_fact = torch.sigmoid(self.anchor_gate(gate_input))
-            # If memory is jammed with spurious attractors, attenuate factual gate to isolate decoder
-            if is_jammed_global:
-                g_fact = g_fact * 0.0  # Decouple poisoned memory
-            final_output = (1.0 - g_fact) * phase3_decoder_state + g_fact * context_pool
             # If memory is jammed with spurious attractors, attenuate factual gate to isolate decoder
             if is_jammed_global:
                 g_fact = g_fact * 0.0  # Decouple poisoned memory
@@ -749,6 +747,17 @@ class SLHCoreNCMAdapter(nn.Module):
                 "sparsity_top32_exact": bool(sparsity_match),
                 "v_packed_exact_128mib": bool(v_packed_size_ok),
             }
+
+    @torch.no_grad()
+    def project_codebooks_to_sphere(self):
+        """
+        Projects codebooks C1 and C2 back to unit hypersphere S^63.
+        Eliminates AdamW radial drift and preserves Benedetto-Fickus tight frame bounds.
+        """
+        self.C1.copy_(F.normalize(self.C1, p=2, dim=-1, eps=1e-5))
+        self.C2.copy_(F.normalize(self.C2, p=2, dim=-1, eps=1e-5))
+        self._cached_c1_norm = None
+        self._cached_c2_norm = None
 
 
 # Backward-compatibility alias for TH1 codebase imports

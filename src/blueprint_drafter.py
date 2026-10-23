@@ -63,8 +63,8 @@ class BlueprintConfig:
     # Параметри адресації пам'яті SLH-Core v2
     hopfield_num_groups: int = 16    # 16 тематичних груп (16 x 24 = 384)
     hopfield_group_dim: int = 24     # Розмірність представлення групи
-    hopfield_dim_i: int = 512        # Перший ортогональний індекс координати (512 слотів)
-    hopfield_dim_j: int = 512        # Другий ортогональний індекс координати (512 слотів)
+    hopfield_dim_i: int = 1024       # Перший ортогональний індекс координати (1024 слотів SLH-Core)
+    hopfield_dim_j: int = 1024       # Другий ортогональний індекс координати (1024 слотів SLH-Core)
     
     # Квантовані біни бюджету довжини блоку
     length_bins: Tuple[int, ...] = (200, 300, 400, 500)
@@ -360,9 +360,13 @@ class BlueprintPredictionHeads(nn.Module):
             i = torch.argmax(logits_i, dim=-1)
             j = torch.argmax(logits_j, dim=-1)
         else:
-            g = torch.argmax(logits_g + torch.randn_like(logits_g) * temperature, dim=-1)
-            i = torch.argmax(logits_i + torch.randn_like(logits_i) * temperature, dim=-1)
-            j = torch.argmax(logits_j + torch.randn_like(logits_j) * temperature, dim=-1)
+            # Gumbel-Max categorical sampling (exact discrete distribution without Gaussian logit distortion)
+            u_g = torch.rand_like(logits_g).clamp(1e-10, 1.0 - 1e-10)
+            u_i = torch.rand_like(logits_i).clamp(1e-10, 1.0 - 1e-10)
+            u_j = torch.rand_like(logits_j).clamp(1e-10, 1.0 - 1e-10)
+            g = torch.argmax(logits_g / max(temperature, 1e-3) - torch.log(-torch.log(u_g)), dim=-1)
+            i = torch.argmax(logits_i / max(temperature, 1e-3) - torch.log(-torch.log(u_i)), dim=-1)
+            j = torch.argmax(logits_j / max(temperature, 1e-3) - torch.log(-torch.log(u_j)), dim=-1)
             
         hopfield_coords = (g, i, j)
         

@@ -34,43 +34,75 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-# Add project root to sys.path to support direct execution
+# Add project root and parent dir to sys.path to support both direct and remote execution
 _root = str(Path(__file__).resolve().parent.parent)
-if _root not in sys.path:
-    sys.path.insert(0, _root)
+_parent = str(Path(__file__).resolve().parent)
+for p in (_root, _parent):
+    if p not in sys.path:
+        sys.path.insert(0, p)
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from transformers import PreTrainedModel, AutoConfig, AutoModel, AutoModelForCausalLM
-from src.configuration_hetman2 import Hetman2Config
 
-# Import low-level primitives from sibling modules
-from src.quantization import (
-    BitLinear,
-    FastWalshHadamardTransform,
-    LogitSoftCapping,
-    SwiGLUClamped,
-    blockwise_fwht_forward,
-)
-from src.dynamic_blueprint_evolver import (
-    DynamicBlueprintEvolver,
-    GramSchmidtSubspaceFilter,
-    SemanticContentExtractor,
-    SphericalNorm,
-)
-from src.hopfield_kv_cache import (
-    HopfieldKVCache,
-    AttractorAugmentedAttention,
-)
-from src.dual_loop_deliberation import (
-    CognitiveDifficultyRouter,
-    ThoughtVerbalizerHead,
-    CognitiveLevel,
-    DeliberationProfile,
-    PROFILES,
-)
+try:
+    from src.configuration_hetman2 import Hetman2Config
+except ImportError:
+    from configuration_hetman2 import Hetman2Config
+
+# Import low-level primitives from sibling modules with robust fallback
+try:
+    from src.quantization import (
+        BitLinear,
+        FastWalshHadamardTransform,
+        LogitSoftCapping,
+        SwiGLUClamped,
+        blockwise_fwht_forward,
+    )
+    from src.dynamic_blueprint_evolver import (
+        DynamicBlueprintEvolver,
+        GramSchmidtSubspaceFilter,
+        SemanticContentExtractor,
+        SphericalNorm,
+    )
+    from src.hopfield_kv_cache import (
+        HopfieldKVCache,
+        AttractorAugmentedAttention,
+    )
+    from src.dual_loop_deliberation import (
+        CognitiveDifficultyRouter,
+        ThoughtVerbalizerHead,
+        CognitiveLevel,
+        DeliberationProfile,
+        PROFILES,
+    )
+except ImportError:
+    from quantization import (
+        BitLinear,
+        FastWalshHadamardTransform,
+        LogitSoftCapping,
+        SwiGLUClamped,
+        blockwise_fwht_forward,
+    )
+    from dynamic_blueprint_evolver import (
+        DynamicBlueprintEvolver,
+        GramSchmidtSubspaceFilter,
+        SemanticContentExtractor,
+        SphericalNorm,
+    )
+    from hopfield_kv_cache import (
+        HopfieldKVCache,
+        AttractorAugmentedAttention,
+    )
+    from dual_loop_deliberation import (
+        CognitiveDifficultyRouter,
+        ThoughtVerbalizerHead,
+        CognitiveLevel,
+        DeliberationProfile,
+        PROFILES,
+    )
 
 # ==============================================================================
 # 0. OPERATING MODE CONSTANTS (100% PARAMETER REUSE)
@@ -497,11 +529,15 @@ class SpeculativeLatentHopfieldCore(nn.Module):
         self.C1 = nn.Parameter(torch.randn(self.num_groups, self.codebook_size, self.code_dim))
         self.C2 = nn.Parameter(torch.randn(self.num_groups, self.codebook_size, self.code_dim))
 
-        # Non-differentiable PID dynamic router biases
+        # Non-differentiable PID dynamic router buffers
         self.register_buffer("b1", torch.zeros(self.num_groups, self.codebook_size))
         self.register_buffer("b2", torch.zeros(self.num_groups, self.codebook_size))
         self.register_buffer("prev_err1", torch.zeros(self.num_groups, self.codebook_size))
         self.register_buffer("prev_err2", torch.zeros(self.num_groups, self.codebook_size))
+        target_f1_init = self.topk_1 / float(self.codebook_size)
+        target_f2_init = self.topk_2 / float(self.codebook_size)
+        self.register_buffer("f1_ema", torch.full((self.num_groups, self.codebook_size), target_f1_init))
+        self.register_buffer("f2_ema", torch.full((self.num_groups, self.codebook_size), target_f2_init))
 
         # Attractor Value Tensor V: [16, 1024, 1024, 32] in ternary representation
         self.V = nn.Parameter(torch.empty(self.num_groups, self.codebook_size, self.codebook_size, self.val_dim))
@@ -573,15 +609,31 @@ class SpeculativeLatentHopfieldCore(nn.Module):
 
                 target_f1 = self.topk_1 / float(self.codebook_size)
                 target_f2 = self.topk_2 / float(self.codebook_size)
-                err1 = (f1 - target_f1) / target_f1
-                err2 = (f2 - target_f2) / target_f2
-                d_err1 = err1 - self.prev_err1
-                d_err2 = err2 - self.prev_err2
 
+                # Smooth EMA update (Low-Pass Filter) to eliminate high-frequency noise & derivative kick
+                ema_alpha = 0.05
+                self.f1_ema.mul_(1.0 - ema_alpha).add_(f1, alpha=ema_alpha)
+                self.f2_ema.mul_(1.0 - ema_alpha).add_(f2, alpha=ema_alpha)
+
+                # Normalized relative error (bounded to [-5.0, 5.0] to prevent bang-bang oscillations)
+                err1 = torch.clamp((self.f1_ema - target_f1) / target_f1, -5.0, 5.0)
+                err2 = torch.clamp((self.f2_ema - target_f2) / target_f2, -5.0, 5.0)
+
+                # Low-pass filtered derivative term (prevents phase lag and limit cycles)
+                d_err1 = 0.2 * (err1 - self.prev_err1)
+                d_err2 = 0.2 * (err2 - self.prev_err2)
+
+                # Leaky Integrator decay (prevents integrator windup during long dialogues)
+                leak_rate = 0.001
+                self.b1.mul_(1.0 - leak_rate)
+                self.b2.mul_(1.0 - leak_rate)
+
+                # PID update
                 self.b1.sub_(self.pid_ki * err1 + self.pid_kd * d_err1)
                 self.b2.sub_(self.pid_ki * err2 + self.pid_kd * d_err2)
                 self.b1.clamp_(-0.5, 0.5)
                 self.b2.clamp_(-0.5, 0.5)
+
                 self.prev_err1.copy_(err1)
                 self.prev_err2.copy_(err2)
 
@@ -628,6 +680,12 @@ class SpeculativeLatentHopfieldCore(nn.Module):
         )
 
         return y_know, commit_loss
+
+    @torch.no_grad()
+    def project_codebooks_to_sphere(self):
+        """Projects codebooks C1 and C2 back to unit hypersphere S^63."""
+        self.C1.copy_(F.normalize(self.C1, p=2, dim=-1, eps=1e-5))
+        self.C2.copy_(F.normalize(self.C2, p=2, dim=-1, eps=1e-5))
 
 
 # ==============================================================================

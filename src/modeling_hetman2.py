@@ -529,7 +529,7 @@ class SpeculativeLatentHopfieldCore(nn.Module):
         self.C1 = nn.Parameter(torch.randn(self.num_groups, self.codebook_size, self.code_dim))
         self.C2 = nn.Parameter(torch.randn(self.num_groups, self.codebook_size, self.code_dim))
 
-        # Non-differentiable PID dynamic router buffers
+        # Non-differentiable PID dynamic router biases (Leaky PID with EMA filter)
         self.register_buffer("b1", torch.zeros(self.num_groups, self.codebook_size))
         self.register_buffer("b2", torch.zeros(self.num_groups, self.codebook_size))
         self.register_buffer("prev_err1", torch.zeros(self.num_groups, self.codebook_size))
@@ -609,8 +609,6 @@ class SpeculativeLatentHopfieldCore(nn.Module):
 
                 target_f1 = self.topk_1 / float(self.codebook_size)
                 target_f2 = self.topk_2 / float(self.codebook_size)
-
-                # Smooth EMA update (Low-Pass Filter) to eliminate high-frequency noise & derivative kick
                 ema_alpha = 0.05
                 self.f1_ema.mul_(1.0 - ema_alpha).add_(f1, alpha=ema_alpha)
                 self.f2_ema.mul_(1.0 - ema_alpha).add_(f2, alpha=ema_alpha)
@@ -623,7 +621,7 @@ class SpeculativeLatentHopfieldCore(nn.Module):
                 d_err1 = 0.2 * (err1 - self.prev_err1)
                 d_err2 = 0.2 * (err2 - self.prev_err2)
 
-                # Leaky Integrator decay (prevents integrator windup during long dialogues)
+                # Leaky Integrator decay (prevents integrator windup during long sequences)
                 leak_rate = 0.001
                 self.b1.mul_(1.0 - leak_rate)
                 self.b2.mul_(1.0 - leak_rate)
@@ -683,7 +681,7 @@ class SpeculativeLatentHopfieldCore(nn.Module):
 
     @torch.no_grad()
     def project_codebooks_to_sphere(self):
-        """Projects codebooks C1 and C2 back to unit hypersphere S^63."""
+        """Projects codebooks C1 and C2 back onto the unit hypersphere S^63."""
         self.C1.copy_(F.normalize(self.C1, p=2, dim=-1, eps=1e-5))
         self.C2.copy_(F.normalize(self.C2, p=2, dim=-1, eps=1e-5))
 

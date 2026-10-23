@@ -358,6 +358,7 @@ class SLHCoreNCMAdapter(nn.Module):
         Returns:
             energy: [B, K, num_groups] Continuous Hopfield Lyapunov energy per group
         """
+        # Centered Log-Sum-Exp contraction over the 32 active attractor states
         num_slots = pair_scores_flat.shape[-1]
         lse = torch.logsumexp(self.beta * pair_scores_flat, dim=-1)  # [B, K, num_groups]
         energy = - (1.0 / self.beta) * (lse - math.log(float(num_slots)))
@@ -498,7 +499,7 @@ class SLHCoreNCMAdapter(nn.Module):
         attn_var_g = torch.var(attn_weights, dim=-1)  # [B, K, 16]
 
         # Group-level jamming gate: suppresses dynamic micro-facts when trapped in uniform spurious superposition
-        # Calibrated for beta = 8.0: selective states have entropy < 0.40; spurious states have entropy > 0.85
+        # Smooth sigmoid gate: 0.0 when selective, 1.0 when jammed
         spurious_jammed_g = (entropy_g > 0.85) | (attn_var_g < 1e-4)
         jam_gate_g = torch.sigmoid((entropy_g - 0.80) * 20.0)  # [B, K, 16]
 
@@ -751,8 +752,9 @@ class SLHCoreNCMAdapter(nn.Module):
     @torch.no_grad()
     def project_codebooks_to_sphere(self):
         """
-        Projects codebooks C1 and C2 back to unit hypersphere S^63.
-        Eliminates AdamW radial drift and preserves Benedetto-Fickus tight frame bounds.
+        Projects codebooks C1 and C2 back onto the unit hypersphere S^63.
+        Used post-optimizer step to prevent AdamW radial norm drift while
+        preserving Benedetto-Fickus tight frame angle relations.
         """
         self.C1.copy_(F.normalize(self.C1, p=2, dim=-1, eps=1e-5))
         self.C2.copy_(F.normalize(self.C2, p=2, dim=-1, eps=1e-5))

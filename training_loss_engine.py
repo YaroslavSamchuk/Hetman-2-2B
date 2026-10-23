@@ -415,19 +415,15 @@ def create_hybrid_optimizers(
     muon_params: List[torch.Tensor] = []
     adamw_params: List[torch.Tensor] = []
 
+    # Identifiers for parameters that must remain in AdamW (embeddings, codebooks, anchors, attractors)
+    adamw_keywords = ("embed", "codebook", "hopfield", "v_shared", "anchor", "pattern", "prototype")
+
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        name_lower = name.lower()
         is_muon_eligible = (
             p.ndim == 2
-            and "embed" not in name_lower
-            and "codebook" not in name_lower
-            and "hopfield" not in name_lower
-            and "v_shared" not in name_lower
-            and "anchor" not in name_lower
-            and "pattern" not in name_lower
-            and "prototype" not in name_lower
+            and not any(kw in name.lower() for kw in adamw_keywords)
         )
         if is_muon_eligible:
             muon_params.append(p)
